@@ -1,0 +1,45 @@
+name: Bug Report
+description: Report a connector bug or regression.
+title: "[Bugfix] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Minimal steps, command, and kv-transfer-config.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Python, vLLM, SemBlend connector, SemBlend if installed.
+      placeholder: "Python 3.11, vLLM 0.x, semblend-vllm-connector 0.x"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Connector mode
+      options:
+        - discovery_only
+        - exact_prefix
+        - request_only_experimental
+        - segmented_experimental
+        - unknown
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: text

@@ -1,0 +1,19 @@
+{
+  "kv_connector": "SemBlendVllmConnector",
+  "kv_connector_module_path": "semblend_vllm_connector.connector",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "mode": "discovery_only",
+    "provider": "semblend",
+    "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+    "min_prompt_tokens": 256,
+    "min_similarity": 0.7,
+    "min_reuse_ratio": 0.5,
+    "embedder_type": "minilm",
+    "lookup_top_k": 5,
+    "register_donors": true,
+    "enable_prompt_text": false,
+    "log_decisions": true
+  }
+}

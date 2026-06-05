@@ -1,0 +1,70 @@
+[project]
+name = "semblend-vllm-connector"
+version = "0.1.0"
+description = "Out-of-tree vLLM KVConnector for SemBlend semantic KV donor discovery"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    { name = "WorldFlow AI" },
+]
+keywords = ["vllm", "kv-cache", "semantic-kv", "semblend", "llm-inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+vllm = [
+    "vllm>=0.8.0",
+    "torch>=2.0",
+    "safetensors>=0.4",
+]
+semblend = [
+    "semblend>=0.3.12",
+]
+dev = [
+    "build>=1.2",
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "twine>=5.0",
+]
+
+[project.urls]
+Repository = "https://github.com/worldflowai/semblend-vllm-connector"
+Issues = "https://github.com/worldflowai/semblend-vllm-connector/issues"
+Changelog = "https://github.com/worldflowai/semblend-vllm-connector/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+semblend_vllm_connector = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
