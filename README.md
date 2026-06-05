@@ -30,13 +30,13 @@ Default behavior is **discovery-only**:
 
 ## Install
 
-Development:
+From PyPI:
 
 ```bash
-pip install -e ".[dev]"
+pip install "semblend-vllm-connector[semblend]"
 ```
 
-With SemBlend provider support:
+Development:
 
 ```bash
 pip install -e ".[semblend,dev]"
@@ -126,7 +126,6 @@ docs/
   ARCHITECTURE.md     detailed architecture and rollout plan
   SEMBLEND_PROVIDER.md
   VLLM_CONNECTOR_CONTRACT.md
-  VALIDATION.md       validation matrix
 
 examples/
   discovery_kv_transfer_config.json

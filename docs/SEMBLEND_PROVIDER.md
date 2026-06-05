@@ -24,7 +24,7 @@ users to validate workload fit without changing model outputs.
 Install with SemBlend support:
 
 ```bash
-pip install -e ".[semblend]"
+pip install "semblend-vllm-connector[semblend]"
 ```
 
 Configure the provider:
