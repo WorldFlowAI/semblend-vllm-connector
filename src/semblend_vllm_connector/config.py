@@ -25,8 +25,10 @@ _EXTRA_CONFIG_KEYS = (
     "lookup_top_k",
     "enable_prompt_text",
     "log_decisions",
+    "audit_path",
     "kv_storage_path",
     "max_materialized_tokens",
+    "allow_non_identical_request_only",
 )
 
 
@@ -108,8 +110,10 @@ class SemBlendVllmConfig:
     lookup_top_k: int = 5
     enable_prompt_text: bool = False
     log_decisions: bool = True
+    audit_path: str | None = None
     kv_storage_path: str = "/tmp/semblend-vllm-kv"
     max_materialized_tokens: int = 4096
+    allow_non_identical_request_only: bool = False
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "SemBlendVllmConfig":
@@ -160,6 +164,10 @@ class SemBlendVllmConfig:
                 extra, "enable_prompt_text", "SEMBLEND_VLLM_ENABLE_PROMPT_TEXT", False
             ),
             log_decisions=_read_bool(extra, "log_decisions", "SEMBLEND_VLLM_LOG_DECISIONS", True),
+            audit_path=(
+                str(extra.get("audit_path") or os.environ.get("SEMBLEND_VLLM_AUDIT_PATH") or "")
+                or None
+            ),
             kv_storage_path=str(
                 extra.get(
                     "kv_storage_path",
@@ -171,5 +179,11 @@ class SemBlendVllmConfig:
                 "max_materialized_tokens",
                 "SEMBLEND_VLLM_MAX_MATERIALIZED_TOKENS",
                 4096,
+            ),
+            allow_non_identical_request_only=_read_bool(
+                extra,
+                "allow_non_identical_request_only",
+                "SEMBLEND_VLLM_ALLOW_NON_IDENTICAL_REQUEST_ONLY",
+                False,
             ),
         )

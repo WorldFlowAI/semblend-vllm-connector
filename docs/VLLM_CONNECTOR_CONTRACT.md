@@ -74,3 +74,20 @@ The connector should separate:
 - lookup latency.
 
 Only backend-confirmed materialization should count as confirmed KV reuse.
+
+## Audit Contract
+
+When `audit_path` / `SEMBLEND_VLLM_AUDIT_PATH` is set, the connector emits
+JSONL events with `schema_version=1`.
+
+Benchmark and product gates should treat:
+
+- `semantic_lookup_hit` as discovery evidence only;
+- `request_only_load_advertised` / `exact_prefix_load_advertised` as a load
+  promise only;
+- `runtime_materialized` as backend-confirmed KV materialization;
+- `runtime_materialization_declined` as a declined load with a reason.
+
+Do not count semantic hits or advertised loads as materialized KV reuse unless a
+matching `runtime_materialized` event exists and negative controls remain at
+zero.

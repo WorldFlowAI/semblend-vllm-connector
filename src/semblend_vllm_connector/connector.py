@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from collections import Counter
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from semblend_vllm_connector._vllm_compat import (
@@ -57,6 +58,25 @@ def _normalize_block_ids(block_ids: Any) -> tuple[list[int], ...] | None:
     return tuple(list(group) for group in block_ids)
 
 
+def _first_non_empty(*values: Any) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _common_prefix_len(left: list[int], right: list[int]) -> int:
+    count = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        count += 1
+    return count
+
+
 class SemBlendVllmConnector(KVConnectorBase_V1):
     """Safe-by-default SemBlend-backed vLLM OOT connector."""
 
@@ -76,6 +96,8 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._pending_loads: dict[str, PendingLoad] = {}
         self._stats: Counter[str] = Counter()
         self._block_size = int(getattr(getattr(vllm_config, "cache_config", None), "block_size", 16))
+        self._prompt_tokenizer: Any | None = None
+        self._prompt_tokenizer_failed = False
 
         self._provider = load_provider(self._config)
 
@@ -86,18 +108,24 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 self._config.mode.value,
                 self._config.provider,
             )
+        self._audit_event(
+            "connector_initialized",
+            role=str(role),
+            mode=self._config.mode.value,
+            provider=self._config.provider,
+            block_size=self._block_size,
+        )
 
     @property
     def stats_snapshot(self) -> dict[str, int]:
         return dict(self._stats)
 
     def _token_ids(self, request: Any) -> list[int]:
-        token_ids = getattr(request, "all_token_ids", None)
-        if token_ids is None:
-            token_ids = getattr(request, "prompt_token_ids", None)
-        if token_ids is None:
-            token_ids = getattr(request, "token_ids", None)
-        return list(token_ids or [])
+        for attr in ("prompt_token_ids", "all_token_ids", "token_ids"):
+            token_ids = getattr(request, attr, None)
+            if token_ids:
+                return list(token_ids)
+        return []
 
     def _prompt_text(self, request: Any) -> str | None:
         if not self._config.enable_prompt_text:
@@ -106,10 +134,120 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             value = getattr(request, attr, None)
             if isinstance(value, str):
                 return value
+        prompt_token_ids = getattr(request, "prompt_token_ids", None)
+        return self._decode_prompt_tokens(prompt_token_ids or self._token_ids(request))
+
+    def _decode_prompt_tokens(self, token_ids: Any) -> str | None:
+        if not token_ids or self._prompt_tokenizer_failed:
+            return None
+        try:
+            tokenizer = self._get_prompt_tokenizer()
+            if tokenizer is None:
+                return None
+            text = tokenizer.decode(list(token_ids), skip_special_tokens=True)
+            return text.strip() or None
+        except Exception:
+            logger.warning("SemBlend prompt token decode failed", exc_info=True)
+            self._prompt_tokenizer_failed = True
         return None
+
+    def _get_prompt_tokenizer(self) -> Any | None:
+        if self._prompt_tokenizer is not None:
+            return self._prompt_tokenizer
+        if self._prompt_tokenizer_failed:
+            return None
+        try:
+            from transformers import AutoTokenizer
+
+            model_config = getattr(self._vllm_config, "model_config", None)
+            tokenizer_id = (
+                getattr(model_config, "tokenizer", None)
+                or self._config.model_id
+                or getattr(model_config, "model", None)
+            )
+            if not tokenizer_id:
+                self._prompt_tokenizer_failed = True
+                return None
+            self._prompt_tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, use_fast=True)
+            return self._prompt_tokenizer
+        except Exception:
+            logger.warning("SemBlend prompt tokenizer load failed", exc_info=True)
+            self._prompt_tokenizer_failed = True
+            return None
 
     def _request_id(self, request: Any) -> str:
         return str(getattr(request, "request_id", "unknown-request"))
+
+    def _audit_event(self, event: str, **fields: Any) -> None:
+        if not self._config.audit_path:
+            return
+        record = {
+            "schema_version": 1,
+            "event": event,
+            "source": "semblend_vllm_connector",
+            "time_unix_s": time.time(),
+            "mode": self._config.mode.value,
+            **fields,
+        }
+        try:
+            parent = os.path.dirname(self._config.audit_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self._config.audit_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception:
+            self._stats["audit_errors_total"] += 1
+            logger.warning("SemBlend audit event write failed", exc_info=True)
+
+    def _routing_metadata(self, request: Any) -> dict[str, str]:
+        """Extract tenant/template routing keys from common vLLM request shapes.
+
+        Gateways differ in where they place request-scoped metadata. Keep this
+        conservative and canonicalize only the keys Synapse uses for donor reuse
+        policy; unknown metadata stays out of the fleet-routing contract.
+        """
+        mappings: list[Mapping[str, Any]] = []
+        for attr in (
+            "metadata",
+            "request_metadata",
+            "extra_metadata",
+            "extra_headers",
+            "trace_headers",
+        ):
+            value = getattr(request, attr, None)
+            if isinstance(value, Mapping):
+                mappings.append(value)
+
+        normalized: dict[str, Any] = {}
+        for mapping in mappings:
+            for key, value in mapping.items():
+                normalized[str(key).lower().replace("-", "_")] = value
+
+        tenant = _first_non_empty(
+            getattr(request, "tenant_id", None),
+            getattr(request, "tenant", None),
+            normalized.get("tenant_id"),
+            normalized.get("tenant"),
+            normalized.get("x_synapse_tenant"),
+            normalized.get("x_worldflow_tenant"),
+        )
+        template = _first_non_empty(
+            getattr(request, "template_id", None),
+            getattr(request, "template", None),
+            getattr(request, "chat_template", None),
+            normalized.get("template_id"),
+            normalized.get("template"),
+            normalized.get("chat_template"),
+            normalized.get("x_synapse_template"),
+            normalized.get("x_worldflow_template"),
+        )
+
+        metadata: dict[str, str] = {}
+        if tenant:
+            metadata["tenant"] = tenant
+        if template:
+            metadata["template"] = template
+        return metadata
 
     def _storage_key(self, donor_id: str, namespace: str) -> str:
         raw = f"{namespace}:{donor_id}".encode("utf-8")
@@ -259,6 +397,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
         if result is None:
             self._stats["semantic_misses_total"] += 1
+            self._audit_event(
+                "semantic_lookup_miss",
+                request_id=request_id,
+                namespace=namespace,
+                latency_ms=elapsed_ms,
+            )
             if self._config.log_decisions:
                 logger.info(
                     "SemBlend semantic lookup miss request_id=%s namespace=%s latency_ms=%d",
@@ -269,6 +413,18 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             return 0, False
 
         self._stats["semantic_hits_total"] += 1
+        self._audit_event(
+            "semantic_lookup_hit",
+            request_id=request_id,
+            donor_id=result.donor_id,
+            namespace=namespace,
+            similarity=float(result.similarity),
+            materialization_kind=result.materialization_kind.value,
+            reusable_tokens=int(result.reusable_token_count),
+            reason=result.reason,
+            latency_ms=elapsed_ms,
+            already_computed_tokens=int(num_computed_tokens),
+        )
         if self._config.log_decisions:
             logger.info(
                 "SemBlend semantic lookup hit request_id=%s donor_id=%s similarity=%.4f "
@@ -283,6 +439,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             )
         if self._config.mode == ReuseMode.DISCOVERY_ONLY:
             self._stats["materialization_suppressed_by_mode"] += 1
+            self._audit_event(
+                "materialization_suppressed_by_mode",
+                request_id=request_id,
+                donor_id=result.donor_id,
+                namespace=namespace,
+                materialization_kind=result.materialization_kind.value,
+            )
             if result.materialization_kind == MaterializationKind.DISCOVERY_ONLY:
                 self._stats["discovery_only_hits_total"] += 1
             return 0, False
@@ -293,12 +456,16 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             and self._has_stored_donor(result.donor_id, namespace)
             and num_computed_tokens == 0
         ):
+            donor_token_ids = list(result.donor_token_ids)
+            common_prefix = _common_prefix_len(donor_token_ids, token_ids)
             max_candidate_tokens = min(
                 len(token_ids),
-                len(result.donor_token_ids),
+                len(donor_token_ids),
                 self._stored_donor_token_count(result.donor_id, namespace),
                 self._config.max_materialized_tokens,
             )
+            if not self._config.allow_non_identical_request_only:
+                max_candidate_tokens = min(max_candidate_tokens, common_prefix)
             token_count = _cacheable_prefix_tokens(max_candidate_tokens, self._block_size)
             if token_count > 0:
                 self._pending_loads[request_id] = PendingLoad(
@@ -309,6 +476,18 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     namespace=namespace,
                 )
                 self._stats["request_only_loads_advertised_total"] += 1
+                self._audit_event(
+                    "request_only_load_advertised",
+                    request_id=request_id,
+                    donor_id=result.donor_id,
+                    namespace=namespace,
+                    tokens=int(token_count),
+                    materialization_kind=MaterializationKind.REQUEST_ONLY.value,
+                    common_prefix_tokens=int(common_prefix),
+                    allow_non_identical_request_only=bool(
+                        self._config.allow_non_identical_request_only
+                    ),
+                )
                 if self._config.log_decisions:
                     logger.info(
                         "SemBlend request-local experimental load advertised "
@@ -316,8 +495,21 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                         request_id,
                         result.donor_id,
                         token_count,
-                    )
+                )
                 return token_count, False
+            self._stats["request_only_loads_rejected_non_identical_prefix"] += int(
+                not self._config.allow_non_identical_request_only
+                and common_prefix < len(token_ids)
+            )
+            self._audit_event(
+                "request_only_load_rejected",
+                request_id=request_id,
+                donor_id=result.donor_id,
+                namespace=namespace,
+                common_prefix_tokens=int(common_prefix),
+                candidate_tokens=int(max_candidate_tokens),
+                reason="non_identical_prefix",
+            )
 
         if result.materialization_kind == MaterializationKind.DISCOVERY_ONLY:
             self._stats["discovery_only_hits_total"] += 1
@@ -337,9 +529,24 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 namespace=namespace,
             )
             self._stats["exact_prefix_loads_advertised_total"] += 1
+            self._audit_event(
+                "exact_prefix_load_advertised",
+                request_id=request_id,
+                donor_id=result.donor_id,
+                namespace=namespace,
+                tokens=int(result.reusable_token_count),
+                materialization_kind=result.materialization_kind.value,
+            )
             return result.reusable_token_count, False
 
         self._stats["materialization_rejected_no_safe_plan"] += 1
+        self._audit_event(
+            "materialization_rejected_no_safe_plan",
+            request_id=request_id,
+            donor_id=result.donor_id,
+            namespace=namespace,
+            materialization_kind=result.materialization_kind.value,
+        )
         return 0, False
 
     def update_state_after_alloc(
@@ -364,6 +571,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             materialization_kind=pending.materialization_kind,
             namespace=pending.namespace,
             block_ids=block_ids,
+        )
+        self._audit_event(
+            "load_allocated",
+            request_id=request_id,
+            donor_id=pending.donor_id,
+            namespace=pending.namespace,
+            tokens=int(pending.token_count),
+            materialization_kind=pending.materialization_kind.value,
+            block_id_count=sum(len(group) for group in block_ids or ()),
         )
 
     def _build_store_metadata(self, scheduler_output: "SchedulerOutput") -> list[PendingStore]:
@@ -421,6 +637,14 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         for load in metadata.loads:
             if load.block_ids is None:
                 raise RuntimeError(f"SemBlend load missing destination blocks: {load.request_id}")
+            self._audit_event(
+                "runtime_materialization_started",
+                request_id=load.request_id,
+                donor_id=load.donor_id,
+                namespace=load.namespace,
+                tokens=int(load.token_count),
+                materialization_kind=load.materialization_kind.value,
+            )
             if self._config.log_decisions:
                 logger.info(
                     "SemBlend materializing request_id=%s donor_id=%s tokens=%d",
@@ -428,6 +652,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     load.donor_id,
                     load.token_count,
                 )
+            layers_materialized = 0
             for layer_name, layer in getattr(forward_context, "no_compile_layers", {}).items():
                 kv_cache_attr = getattr(layer, "kv_cache", None)
                 if kv_cache_attr is None:
@@ -451,7 +676,29 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     slot_mapping,
                     attn_metadata,
                 )
+                layers_materialized += 1
+            if layers_materialized <= 0:
+                self._stats["loads_rejected_no_kv_layers"] += 1
+                self._audit_event(
+                    "runtime_materialization_declined",
+                    request_id=load.request_id,
+                    donor_id=load.donor_id,
+                    namespace=load.namespace,
+                    tokens=int(load.token_count),
+                    materialization_kind=load.materialization_kind.value,
+                    declined_reason="no_kv_layers_materialized",
+                )
+                continue
             self._stats["loads_materialized_total"] += 1
+            self._audit_event(
+                "runtime_materialized",
+                request_id=load.request_id,
+                donor_id=load.donor_id,
+                namespace=load.namespace,
+                tokens=int(load.token_count),
+                materialization_kind=load.materialization_kind.value,
+                layers_materialized=layers_materialized,
+            )
             if self._config.log_decisions:
                 logger.info(
                     "SemBlend materialized request_id=%s donor_id=%s tokens=%d",
@@ -507,10 +754,21 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 prompt_text=self._prompt_text(request),
                 model_id=model_id_from_config(self._config, self._vllm_config),
                 namespace=namespace_for_request(self._config, self._vllm_config, request),
-                metadata={"num_blocks": len(block_ids)},
+                metadata={
+                    "num_blocks": len(block_ids),
+                    **self._routing_metadata(request),
+                },
             )
             self._provider.register_donor(donor)
             self._stats["donors_registered_total"] += 1
+            self._audit_event(
+                "donor_registered",
+                request_id=donor.donor_id,
+                namespace=donor.namespace,
+                tokens=len(token_ids),
+                blocks=len(block_ids),
+                metadata=dict(donor.metadata),
+            )
             if self._config.log_decisions:
                 logger.info(
                     "SemBlend donor registered request_id=%s namespace=%s tokens=%d blocks=%d",

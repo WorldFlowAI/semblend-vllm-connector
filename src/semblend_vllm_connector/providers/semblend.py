@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from inspect import signature
+
 from semblend_vllm_connector.config import SemBlendVllmConfig
 from semblend_vllm_connector.types import (
     DonorRegistration,
@@ -88,12 +90,20 @@ class SemBlendPipelineProvider:
         )
 
     def register_donor(self, donor: DonorRegistration) -> None:
-        self._pipeline.register_donor(
-            request_id=donor.donor_id,
-            token_ids=list(donor.token_ids),
-            prompt_text=donor.prompt_text or "",
-            extra_key=donor.namespace,
-        )
+        kwargs = {
+            "request_id": donor.donor_id,
+            "token_ids": list(donor.token_ids),
+            "prompt_text": donor.prompt_text or "",
+            "extra_key": donor.namespace,
+        }
+        tenant = donor.metadata.get("tenant") or donor.metadata.get("tenant_id")
+        template = donor.metadata.get("template") or donor.metadata.get("template_id")
+        params = signature(self._pipeline.register_donor).parameters
+        if tenant and "tenant" in params:
+            kwargs["tenant"] = str(tenant)
+        if template and "template" in params:
+            kwargs["template"] = str(template)
+        self._pipeline.register_donor(**kwargs)
 
     def clear_donors(self) -> None:
         self._pipeline.clear_donors()

@@ -16,15 +16,16 @@ lifecycle.
 
 ## Status
 
-Experimental.
+Experimental, with safe defaults.
 
 Default behavior is **discovery-only**:
 
 - exact vLLM prefix caching remains authoritative;
 - semantic lookup runs only after exact prefix coverage is insufficient;
 - the connector records donor hits, misses, and rejection reasons;
-- it returns `(0, False)` from `get_num_new_matched_tokens()` unless a future
-  materialization mode can prove that the KV can be loaded safely;
+- it returns `(0, False)` from `get_num_new_matched_tokens()` unless a
+  configured materialization mode can prove a block-aligned exact token prefix
+  or an explicitly opted-in isolated proof path;
 - normal vLLM execution continues on every provider error or unsupported case.
 
 
@@ -91,14 +92,37 @@ SemBlend provider mode:
 
 Equivalent JSON examples live in [`examples/`](examples/).
 
+Optional audit stream for reproducible validation:
+
+```json
+{
+  "kv_connector_extra_config": {
+    "audit_path": "/tmp/semblend-vllm-audit.jsonl",
+    "log_decisions": true
+  }
+}
+```
+
+The audit file is JSONL. Runtime KV reuse should be counted only from
+`runtime_materialized` events. Semantic lookup hits and advertised loads are
+reported separately so benchmark runners can distinguish discovery from
+backend-confirmed materialization.
+
 ## Modes
 
 | Mode | Positive matched tokens? | Purpose |
 | --- | --- | --- |
 | `discovery_only` | No | Safe telemetry and workload qualification. |
 | `exact_prefix` | Only with engine-valid exact block refs | Future safe materialization path. |
-| `request_only_experimental` | Yes, block-aligned prefix only | Isolated validation mode; run with vLLM prefix caching disabled. |
-| `segmented_experimental` | Not enabled in this repo yet | Requires segmented/sparse execution support. |
+| `request_only_experimental` | Yes, exact-token-prefix blocks by default | Isolated validation mode; run with vLLM prefix caching disabled. |
+| `segmented_experimental` | Not enabled in this repo yet | Requires segmented/sparse execution and recompute-boundary support. |
+
+`request_only_experimental` defaults to exact-token-prefix materialization. The
+old zero-exact semantic proof behavior requires
+`allow_non_identical_request_only=true` or
+`SEMBLEND_VLLM_ALLOW_NON_IDENTICAL_REQUEST_ONLY=1`. Keep that flag limited to
+quality-gated validation experiments; it is not a production-safe substitute for a
+segmented/recompute engine path.
 
 ## Safety Rules
 
@@ -107,6 +131,8 @@ The connector must not:
 - weaken exact prefix-cache semantics;
 - report semantic hits as computed tokens unless KV can actually be loaded;
 - publish non-identical semantic donor KV into vLLM's exact prefix cache;
+- treat non-identical semantic discovery as materializable unless an explicit
+  validation flag is set and the run has separate quality gates;
 - cross model, tokenizer, adapter, or cache-salt namespaces;
 - fail inference because semantic lookup failed.
 
