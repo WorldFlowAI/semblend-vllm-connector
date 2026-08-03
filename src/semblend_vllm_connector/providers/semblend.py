@@ -13,6 +13,45 @@ from semblend_vllm_connector.types import (
 )
 
 
+def _segments_from_position_map(result) -> list | None:
+    """Group aligned (donor, target) position pairs into contiguous runs.
+
+    Runs advance +1/+1 on both sides; each becomes a SemanticSegment with
+    prompt-absolute target positions (the connector aligns and serves them
+    boundary-anchored).
+    """
+    pmap = getattr(result, "position_map", None)
+    if pmap is None:
+        return None
+    donors = list(getattr(pmap, "donor_positions", []) or [])
+    targets = list(getattr(pmap, "target_positions", []) or [])
+    if not donors or len(donors) != len(targets):
+        return None
+
+    from semblend_vllm_connector.types import SemanticSegment
+
+    segments = []
+    run_start = 0
+    for i in range(1, len(donors) + 1):
+        if (
+            i == len(donors)
+            or donors[i] - donors[i - 1] != 1
+            or targets[i] - targets[i - 1] != 1
+        ):
+            length = i - run_start
+            if length >= 1:
+                segments.append(
+                    SemanticSegment(
+                        donor_id=result.donor_id,
+                        donor_start=donors[run_start],
+                        target_start=targets[run_start],
+                        token_count=length,
+                    )
+                )
+            run_start = i
+    return segments or None
+
+
 class SemBlendPipelineProvider:
     """Adapter from the connector provider protocol to SemBlendPipeline."""
 
@@ -69,12 +108,16 @@ class SemBlendPipelineProvider:
         if not result or not result.found or not result.donor_id:
             return None
 
+        segments = _segments_from_position_map(result)
         return SemanticLookupResult(
             donor_id=result.donor_id,
             similarity=float(result.similarity),
-            reusable_token_count=0,
+            reusable_token_count=(
+                sum(seg.token_count for seg in segments) if segments else 0
+            ),
             materialization_kind=MaterializationKind.DISCOVERY_ONLY,
             donor_token_ids=list(result.donor_tokens or []),
+            segments=segments,
             quality_signals={
                 "reuse_ratio": float(getattr(result, "reuse_ratio", 0.0)),
                 "confidence_tier": getattr(result, "confidence_tier", "unknown"),
