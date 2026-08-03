@@ -98,6 +98,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._config = SemBlendVllmConfig.from_vllm_config(vllm_config)
         self._provider: SemanticKvProvider | None = None
         self._pending_loads: dict[str, PendingLoad] = {}
+        # vllm-fork capability gate: re-consult this connector at chunked
+        # continuation boundaries (mid-prompt external KV). Only the
+        # semantic-span mode benefits; other modes keep stock behavior.
+        self.supports_mid_request_matching = (
+            self._config.mode == ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL
+        )
         self._stats: Counter[str] = Counter()
         self._block_size = int(getattr(getattr(vllm_config, "cache_config", None), "block_size", 16))
         self._prompt_tokenizer: Any | None = None
