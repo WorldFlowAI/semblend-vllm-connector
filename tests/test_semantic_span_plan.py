@@ -71,3 +71,46 @@ class TestSupplyAtBoundary:
         # edge 256; supply = 1088-256 = 832, donor advanced 144.
         n, donor_start = supply_at_boundary(self.SPANS, boundary=250, block_size=16)
         assert n == 832 and donor_start == 856
+
+
+class TestRerotateK:
+    def test_rotation_composes_to_target_positions(self):
+        import math
+
+        import torch
+
+        from semblend_vllm_connector.semantic_span import rerotate_k, rope_cos_sin
+
+        heads, head_dim, n, theta = 2, 32, 8, 10000.0
+        donor_start, target_start = 500, 120
+        k_raw = torch.randn(n, heads, head_dim)
+
+        def rotate(k, start):
+            cos, sin = rope_cos_sin(
+                torch.arange(start, start + n), head_dim, theta
+            )
+            c = cos[:, None, :]
+            s = sin[:, None, :]
+            x1, x2 = k[..., : head_dim // 2], k[..., head_dim // 2 :]
+            return torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1)
+
+        k_donor = rotate(k_raw, donor_start)
+        k_expected = rotate(k_raw, target_start)
+
+        k_out = rerotate_k(
+            k_donor,
+            donor_start=donor_start,
+            target_start=target_start,
+            head_dim=head_dim,
+            rope_theta=theta,
+        )
+        torch.testing.assert_close(k_out, k_expected, atol=1e-4, rtol=1e-4)
+
+    def test_zero_delta_is_identity(self):
+        import torch
+
+        from semblend_vllm_connector.semantic_span import rerotate_k
+
+        k = torch.randn(4, 2, 16)
+        out = rerotate_k(k, donor_start=7, target_start=7, head_dim=16, rope_theta=10000.0)
+        torch.testing.assert_close(out, k)

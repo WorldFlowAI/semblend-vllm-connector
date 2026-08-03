@@ -76,3 +76,48 @@ def supply_at_boundary(
             offset = usable_from - span.target_start
             return span.target_end - usable_from, span.donor_start + offset
     return 0, None
+
+
+def rope_cos_sin(positions, head_dim: int, rope_theta: float):
+    """Cos/sin tables for the given absolute positions (neox half-split)."""
+    import torch
+
+    inv_freq = 1.0 / (
+        rope_theta
+        ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+    )
+    freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
+    return freqs.cos(), freqs.sin()
+
+
+def rerotate_k(
+    k,
+    donor_start: int,
+    target_start: int,
+    head_dim: int,
+    rope_theta: float,
+):
+    """Re-rotate cached K from donor positions to target positions.
+
+    RoPE rotations compose, so rotating by (target - donor) maps a key
+    cached at donor position p + delta exactly onto the key for target
+    position p. V carries no positional encoding and is never touched.
+    K is [tokens, heads, head_dim], neox half-split, full rotary width.
+    """
+    import torch
+
+    if donor_start == target_start:
+        return k
+    n = k.shape[0]
+    delta = target_start - donor_start
+    # Rotation by a constant delta: the angle depends on the frequency
+    # only, applied uniformly across tokens.
+    dpos = torch.full((n,), float(delta))
+    cos, sin = rope_cos_sin(dpos, head_dim, rope_theta)
+    orig_dtype = k.dtype
+    kf = k.to(torch.float32)
+    c = cos[:, None, :]
+    s = sin[:, None, :]
+    x1, x2 = kf[..., : head_dim // 2], kf[..., head_dim // 2 :]
+    out = torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1)
+    return out.to(orig_dtype)

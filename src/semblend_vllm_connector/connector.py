@@ -486,6 +486,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     materialization_kind=MaterializationKind.SEMANTIC_SPAN,
                     namespace=namespace,
                     donor_start=donor_start,
+                    target_start=(
+                        (num_computed_tokens + self._block_size - 1)
+                        // self._block_size
+                    )
+                    * self._block_size,
                 )
                 self._stats["semantic_span_loads_advertised_total"] += 1
                 self._audit_event(
@@ -622,6 +627,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             namespace=pending.namespace,
             block_ids=block_ids,
             donor_start=pending.donor_start,
+            target_start=pending.target_start,
         )
         self._audit_event(
             "load_allocated",
@@ -674,6 +680,54 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._pending_loads.clear()
         return SemBlendConnectorMetadata(loads=loads, stores=stores)
 
+    def _rope_params(self) -> tuple[float, int] | None:
+        """(rope_theta, head_dim) from the model config; None when unknown."""
+        model_config = getattr(self._vllm_config, "model_config", None)
+        hf = getattr(model_config, "hf_config", None)
+        theta = getattr(hf, "rope_theta", None)
+        head_dim = getattr(hf, "head_dim", None)
+        if head_dim is None:
+            hidden = getattr(hf, "hidden_size", None)
+            heads = getattr(hf, "num_attention_heads", None)
+            if hidden and heads:
+                head_dim = hidden // heads
+        if theta is None or head_dim is None:
+            return None
+        return float(theta), int(head_dim)
+
+    def _semantic_span_slice(self, src_kv_cache, load, attn_metadata):
+        """Donor-offset slice + K re-rotation for a semantic-span load.
+
+        Returns None (declining the layer) for MLA layouts or when rope
+        parameters are unavailable; callers fall back to normal compute.
+        """
+        import torch
+
+        from semblend_vllm_connector.semantic_span import rerotate_k
+
+        if self._is_mla_metadata(attn_metadata):
+            self._stats["semantic_span_declined_mla"] += 1
+            return None
+        params = self._rope_params()
+        if params is None or load.donor_start is None or load.target_start is None:
+            self._stats["semantic_span_declined_no_rope_params"] += 1
+            return None
+        theta, head_dim = params
+        window = src_kv_cache[
+            :, load.donor_start : load.donor_start + load.token_count, ...
+        ]
+        if window.shape[1] < load.token_count:
+            self._stats["semantic_span_declined_short_donor"] += 1
+            return None
+        k = rerotate_k(
+            window[0],
+            donor_start=load.donor_start,
+            target_start=load.target_start,
+            head_dim=head_dim,
+            rope_theta=theta,
+        )
+        return torch.stack((k, window[1]))
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, SemBlendConnectorMetadata) or not metadata.loads:
@@ -712,7 +766,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 filename = self._layer_filename(load.donor_id, load.namespace, layer_name)
                 tensors = load_file(filename)
                 src_kv_cache = tensors["kv_cache"].to(dst_kv_cache_layer.device)
-                if self._is_mla_metadata(attn_metadata):
+                if load.materialization_kind == MaterializationKind.SEMANTIC_SPAN:
+                    src_kv_cache = self._semantic_span_slice(
+                        src_kv_cache, load, attn_metadata
+                    )
+                    if src_kv_cache is None:
+                        continue
+                elif self._is_mla_metadata(attn_metadata):
                     src_kv_cache = src_kv_cache[: load.token_count, ...]
                 else:
                     src_kv_cache = src_kv_cache[:, : load.token_count, ...]

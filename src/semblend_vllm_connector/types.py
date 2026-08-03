@@ -88,9 +88,11 @@ class PendingLoad:
     materialization_kind: MaterializationKind
     namespace: str
     block_ids: tuple[list[int], ...] | None = None
-    # Semantic-span loads: donor-side position of the first served token,
-    # consumed by the re-rotation loader.
+    # Semantic-span loads: donor- and target-side positions of the first
+    # served token, consumed by the re-rotation loader (delta = target -
+    # donor).
     donor_start: int | None = None
+    target_start: int | None = None
 
 
 @dataclass(frozen=True)

@@ -115,3 +115,57 @@ def test_mid_span_boundary_advances_donor_offset(tmp_path) -> None:
     assert matched == 48  # [40..88)
     load = connector._pending_loads["r1"]  # noqa: SLF001
     assert load.donor_start == 240  # 210 + (40 - 10)
+
+
+def test_semantic_span_slice_rotates_k_and_preserves_v(tmp_path) -> None:
+    import torch
+
+    from semblend_vllm_connector.semantic_span import rerotate_k
+    from semblend_vllm_connector.types import PendingLoad
+
+    connector = _connector(tmp_path)
+
+    class _HF:
+        rope_theta = 10000.0
+        head_dim = 16
+
+    connector._vllm_config.model_config.hf_config = _HF()  # noqa: SLF001
+
+    donor_kv = torch.randn(2, 100, 2, 16)  # [K/V, tokens, heads, head_dim]
+    load = PendingLoad(
+        request_id="r1",
+        donor_id="d1",
+        token_count=8,
+        materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+        namespace="ns",
+        donor_start=40,
+        target_start=12,
+    )
+
+    out = connector._semantic_span_slice(donor_kv, load, attn_metadata=object())  # noqa: SLF001
+
+    assert out.shape == (2, 8, 2, 16)
+    expected_k = rerotate_k(
+        donor_kv[0, 40:48], donor_start=40, target_start=12, head_dim=16, rope_theta=10000.0
+    )
+    torch.testing.assert_close(out[0], expected_k)
+    torch.testing.assert_close(out[1], donor_kv[1, 40:48])  # V untouched
+
+
+def test_semantic_span_slice_declines_without_rope_params(tmp_path) -> None:
+    import torch
+
+    from semblend_vllm_connector.types import PendingLoad
+
+    connector = _connector(tmp_path)
+    load = PendingLoad(
+        request_id="r1",
+        donor_id="d1",
+        token_count=8,
+        materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+        namespace="ns",
+        donor_start=40,
+        target_start=12,
+    )
+    out = connector._semantic_span_slice(torch.randn(2, 100, 2, 16), load, object())  # noqa: SLF001
+    assert out is None
