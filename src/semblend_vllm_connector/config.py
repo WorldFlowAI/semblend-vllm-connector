@@ -100,6 +100,7 @@ class SemBlendVllmConfig:
     provider_class: str | None = None
     model_id: str | None = None
     min_prompt_tokens: int = 256
+    min_semantic_span: int = 512
     min_similarity: float = 0.70
     min_reuse_ratio: float = 0.50
     embedder_type: str | None = None
@@ -143,6 +144,7 @@ class SemBlendVllmConfig:
             provider_class=extra.get("provider_class") or os.environ.get("SEMBLEND_VLLM_PROVIDER_CLASS"),
             model_id=str(model_id) if model_id is not None else None,
             min_prompt_tokens=_read_int(extra, "min_prompt_tokens", "SEMBLEND_VLLM_MIN_PROMPT_TOKENS", 256),
+            min_semantic_span=_read_int(extra, "min_semantic_span", "SEMBLEND_VLLM_MIN_SEMANTIC_SPAN", 512),
             min_similarity=_read_float(extra, "min_similarity", "SEMBLEND_VLLM_MIN_SIMILARITY", 0.70),
             min_reuse_ratio=_read_float(
                 extra, "min_reuse_ratio", "SEMBLEND_VLLM_MIN_REUSE_RATIO", 0.50

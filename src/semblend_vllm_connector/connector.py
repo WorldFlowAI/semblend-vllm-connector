@@ -17,6 +17,10 @@ from semblend_vllm_connector._vllm_compat import (
 )
 from semblend_vllm_connector.config import SemBlendVllmConfig
 from semblend_vllm_connector.namespace import model_id_from_config, namespace_for_request
+from semblend_vllm_connector.semantic_span import (
+    block_align_spans,
+    supply_at_boundary,
+)
 from semblend_vllm_connector.provider import SemanticKvProvider, load_provider
 from semblend_vllm_connector.types import (
     DonorRegistration,
@@ -451,6 +455,52 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             return 0, False
 
         if (
+            self._config.mode == ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL
+            and result.segments
+        ):
+            raw_spans = [
+                {
+                    "target_start": seg.target_start,
+                    "length": seg.token_count,
+                    "donor_start": seg.donor_start,
+                }
+                for seg in result.segments
+                if seg.donor_id == result.donor_id
+            ]
+            spans = block_align_spans(
+                raw_spans, self._block_size, self._config.min_semantic_span
+            )
+            token_count, donor_start = supply_at_boundary(
+                spans, num_computed_tokens, self._block_size
+            )
+            token_count = min(
+                token_count,
+                (self._config.max_materialized_tokens // self._block_size)
+                * self._block_size,
+            )
+            if token_count > 0 and donor_start is not None:
+                self._pending_loads[request_id] = PendingLoad(
+                    request_id=request_id,
+                    donor_id=result.donor_id,
+                    token_count=token_count,
+                    materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+                    namespace=namespace,
+                    donor_start=donor_start,
+                )
+                self._stats["semantic_span_loads_advertised_total"] += 1
+                self._audit_event(
+                    "semantic_span_load_advertised",
+                    request_id=request_id,
+                    donor_id=result.donor_id,
+                    namespace=namespace,
+                    token_count=token_count,
+                    donor_start=donor_start,
+                    boundary=int(num_computed_tokens),
+                )
+                return token_count, False
+            return 0, False
+
+        if (
             self._config.mode == ReuseMode.REQUEST_ONLY_EXPERIMENTAL
             and result.donor_token_ids
             and self._has_stored_donor(result.donor_id, namespace)
@@ -571,6 +621,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             materialization_kind=pending.materialization_kind,
             namespace=pending.namespace,
             block_ids=block_ids,
+            donor_start=pending.donor_start,
         )
         self._audit_event(
             "load_allocated",

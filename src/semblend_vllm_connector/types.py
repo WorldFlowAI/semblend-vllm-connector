@@ -24,6 +24,7 @@ class MaterializationKind(str, Enum):
     DISCOVERY_ONLY = "discovery_only"
     EXACT_PREFIX = "exact_prefix"
     REQUEST_ONLY = "request_only"
+    SEMANTIC_SPAN = "semantic_span"
     SEGMENTED = "segmented"
 
 
@@ -87,6 +88,9 @@ class PendingLoad:
     materialization_kind: MaterializationKind
     namespace: str
     block_ids: tuple[list[int], ...] | None = None
+    # Semantic-span loads: donor-side position of the first served token,
+    # consumed by the re-rotation loader.
+    donor_start: int | None = None
 
 
 @dataclass(frozen=True)
