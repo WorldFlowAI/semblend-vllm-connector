@@ -15,6 +15,9 @@ class ReuseMode(str, Enum):
     EXACT_PREFIX = "exact_prefix"
     REQUEST_ONLY_EXPERIMENTAL = "request_only_experimental"
     SEGMENTED_EXPERIMENTAL = "segmented_experimental"
+    # Semantic-span mode: block-aligned donor spans from token-verified
+    # alignment, served boundary-anchored with RoPE re-rotation at load.
+    SEMANTIC_SPAN_EXPERIMENTAL = "semantic_span_experimental"
 
 
 class MaterializationKind(str, Enum):
