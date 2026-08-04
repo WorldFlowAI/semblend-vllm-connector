@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from semblend_vllm_connector._vllm_compat import (
+    get_virtual_engine,
     KVConnectorBase_V1,
     KVConnectorRole,
 )
@@ -768,7 +769,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 kv_cache_attr = getattr(layer, "kv_cache", None)
                 if kv_cache_attr is None:
                     continue
-                dst_kv_cache_layer = kv_cache_attr[forward_context.virtual_engine]
+                dst_kv_cache_layer = kv_cache_attr[get_virtual_engine(forward_context)]
                 filename = self._layer_filename(load.donor_id, load.namespace, layer_name)
                 tensors = load_file(filename)
                 src_kv_cache = tensors["kv_cache"].to(dst_kv_cache_layer.device)
