@@ -317,6 +317,16 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         pages = slot_mapping // page_size
         offsets = slot_mapping % page_size
         n = int(slot_mapping.numel())
+        if len(dst_shape) == 4:
+            import torch
+
+            heads = dst_shape[1]
+            head_size = dst_shape[3] // 2
+            kv = src_kv_cache.reshape(2, n, heads, head_size)
+            dst_kv_cache_layer[pages, :, offsets, :] = torch.cat(
+                (kv[0], kv[1]), dim=-1
+            )
+            return
         if dst_shape[0] == 2:
             dst_kv_cache_layer[:, pages, offsets, ...] = src_kv_cache.reshape(
                 2, n, *dst_kv_cache_layer.shape[3:]
@@ -347,6 +357,19 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         page_size = layer_shape[2]
         pages = slot_mapping // page_size
         offsets = slot_mapping % page_size
+        import torch
+
+        if len(layer_shape) == 4:
+            # flash_attn v1 packed-content layout:
+            # (blocks, kv_heads, block_size, 2*head_size), K first half of
+            # the content dim, V second (flash_attn.py split convention).
+            page_size = layer_shape[2]
+            pages = slot_mapping // page_size
+            offsets = slot_mapping % page_size
+            gathered = kv_layer[pages, :, offsets, :]  # [n, H, 2D]
+            k, v = gathered.split(layer_shape[3] // 2, dim=-1)
+            stacked = torch.stack((k, v))  # [2, n, H, D]
+            return stacked.reshape(2, stacked.shape[1], -1)
         if layer_shape[0] == 2:
             gathered = kv_layer[:, pages, offsets, ...]
         elif layer_shape[1] == 2:
@@ -756,13 +779,16 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         if window.shape[1] < load.token_count:
             self._stats["semantic_span_declined_short_donor"] += 1
             return None
+        # Stored KV is [2, n, H*D] (flattened); rotation operates per head.
+        n_tok = window.shape[1]
+        k_heads = window[0].reshape(n_tok, -1, head_dim)
         k = rerotate_k(
-            window[0],
+            k_heads,
             donor_start=load.donor_start,
             target_start=load.target_start,
             head_dim=head_dim,
             rope_theta=theta,
-        )
+        ).reshape(n_tok, -1)
         return torch.stack((k, window[1]))
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:

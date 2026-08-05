@@ -131,7 +131,8 @@ def test_semantic_span_slice_rotates_k_and_preserves_v(tmp_path) -> None:
 
     connector._vllm_config.model_config.hf_config = _HF()  # noqa: SLF001
 
-    donor_kv = torch.randn(2, 100, 2, 16)  # [K/V, tokens, heads, head_dim]
+    # Stored donor KV uses the flattened extract contract [2, n, H*D].
+    donor_kv = torch.randn(2, 100, 32)  # heads=2, head_dim=16 flattened
     load = PendingLoad(
         request_id="r1",
         donor_id="d1",
@@ -144,10 +145,14 @@ def test_semantic_span_slice_rotates_k_and_preserves_v(tmp_path) -> None:
 
     out = connector._semantic_span_slice(donor_kv, load, attn_metadata=object())  # noqa: SLF001
 
-    assert out.shape == (2, 8, 2, 16)
+    assert out.shape == (2, 8, 32)
     expected_k = rerotate_k(
-        donor_kv[0, 40:48], donor_start=40, target_start=12, head_dim=16, rope_theta=10000.0
-    )
+        donor_kv[0, 40:48].reshape(8, 2, 16),
+        donor_start=40,
+        target_start=12,
+        head_dim=16,
+        rope_theta=10000.0,
+    ).reshape(8, 32)
     torch.testing.assert_close(out[0], expected_k)
     torch.testing.assert_close(out[1], donor_kv[1, 40:48])  # V untouched
 
@@ -167,7 +172,7 @@ def test_semantic_span_slice_declines_without_rope_params(tmp_path) -> None:
         donor_start=40,
         target_start=12,
     )
-    out = connector._semantic_span_slice(torch.randn(2, 100, 2, 16), load, object())  # noqa: SLF001
+    out = connector._semantic_span_slice(torch.randn(2, 100, 32), load, object())  # noqa: SLF001
     assert out is None
 
 
@@ -220,3 +225,25 @@ def test_extract_and_inject_handle_blocks_first_layout(tmp_path) -> None:
         connector._inject_kv_into_layer(dst, out, slot_mapping, object())  # noqa: SLF001
         back = connector._extract_kv_from_layer(dst, slot_mapping, object())  # noqa: SLF001
         torch.testing.assert_close(back, ref, msg=f"round-trip {layout}")
+
+
+def test_extract_and_inject_round_trip_packed_content_layout(tmp_path) -> None:
+    """(take-11 regression) vLLM 0.26 flash_attn packs K/V into the content
+    dim: (blocks, kv_heads, block_size, 2*head_size), K first half. The
+    4-dim layout must gather, split, and round-trip exactly."""
+    import torch
+
+    connector = _connector(tmp_path)
+    layer = torch.randn(6, 2, 4, 16)  # blocks=6, H=2, bs=4, 2D=16
+    slot_mapping = torch.tensor([5, 6, 13, 21])
+    out = connector._extract_kv_from_layer(layer, slot_mapping, object())  # noqa: SLF001
+    pages, offs = slot_mapping // 4, slot_mapping % 4
+    ref_g = layer[pages, :, offs, :]
+    ref_k, ref_v = ref_g.split(8, dim=-1)
+    ref = torch.stack((ref_k, ref_v)).reshape(2, 4, -1)
+    torch.testing.assert_close(out, ref)
+
+    dst = torch.zeros_like(layer)
+    connector._inject_kv_into_layer(dst, out, slot_mapping, object())  # noqa: SLF001
+    back = connector._extract_kv_from_layer(dst, slot_mapping, object())  # noqa: SLF001
+    torch.testing.assert_close(back, ref)
