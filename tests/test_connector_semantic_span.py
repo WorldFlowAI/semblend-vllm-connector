@@ -169,3 +169,12 @@ def test_semantic_span_slice_declines_without_rope_params(tmp_path) -> None:
     )
     out = connector._semantic_span_slice(torch.randn(2, 100, 2, 16), load, object())  # noqa: SLF001
     assert out is None
+
+
+def test_semantic_span_mode_enables_donor_stores(tmp_path) -> None:
+    """(take-8 regression) SEMANTIC_SPAN mode must persist donor KV: the
+    load path reads per-layer safetensors, so a mode missing from the
+    materialization set advertises loads whose files were never written
+    (FileNotFoundError at start_load_kv, engine death)."""
+    connector = _connector(tmp_path)
+    assert connector._materialization_enabled()  # noqa: SLF001

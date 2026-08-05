@@ -275,6 +275,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             ReuseMode.EXACT_PREFIX,
             ReuseMode.REQUEST_ONLY_EXPERIMENTAL,
             ReuseMode.SEGMENTED_EXPERIMENTAL,
+            ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL,
         }
 
     def _slot_mapping(self, block_ids: tuple[list[int], ...], token_count: int, device: Any):
