@@ -99,6 +99,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._config = SemBlendVllmConfig.from_vllm_config(vllm_config)
         self._provider: SemanticKvProvider | None = None
         self._pending_loads: dict[str, PendingLoad] = {}
+        # Mid-request consults re-enter get_num_new_matched_tokens on every
+        # scheduling step; the semantic lookup (embedding + alignment) is
+        # request-stable, so memoize it per request (cleared on finish).
+        self._lookup_cache: dict[str, Any] = {}
         # vllm-fork capability gate: re-consult this connector at chunked
         # continuation boundaries (mid-prompt external KV). Only the
         # semantic-span mode benefits; other modes keep stock behavior.
@@ -448,16 +452,23 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             already_computed_tokens=num_computed_tokens,
         )
 
-        started = time.monotonic()
-        try:
-            result = self._provider.lookup(lookup)
-        except Exception:
-            logger.exception("SemBlend provider lookup failed; falling back to normal prefill")
-            self._stats["provider_errors_total"] += 1
-            return 0, False
-        finally:
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            self._stats["lookup_latency_ms_sum"] += elapsed_ms
+        if request_id in self._lookup_cache:
+            result = self._lookup_cache[request_id]
+            elapsed_ms = 0
+        else:
+            started = time.monotonic()
+            try:
+                result = self._provider.lookup(lookup)
+            except Exception:
+                logger.exception(
+                    "SemBlend provider lookup failed; falling back to normal prefill"
+                )
+                self._stats["provider_errors_total"] += 1
+                return 0, False
+            finally:
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                self._stats["lookup_latency_ms_sum"] += elapsed_ms
+            self._lookup_cache[request_id] = result
 
         if result is None:
             self._stats["semantic_misses_total"] += 1
@@ -914,6 +925,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        self._lookup_cache.pop(self._request_id(request), None)
         if not self._config.register_donors or self._provider is None:
             return False, None
 
