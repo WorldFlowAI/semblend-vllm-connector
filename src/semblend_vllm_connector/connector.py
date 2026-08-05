@@ -313,16 +313,29 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             dst.reshape(dst_shape)
             return
 
-        num_pages = dst_shape[1]
         page_size = dst_shape[2]
-        dst = dst_kv_cache_layer.reshape(2, num_pages * page_size, -1)
-        dst[:, slot_mapping, ...] = src_kv_cache
-        dst.reshape(dst_shape)
+        pages = slot_mapping // page_size
+        offsets = slot_mapping % page_size
+        n = int(slot_mapping.numel())
+        if dst_shape[0] == 2:
+            dst_kv_cache_layer[:, pages, offsets, ...] = src_kv_cache.reshape(
+                2, n, *dst_kv_cache_layer.shape[3:]
+            )
+        elif dst_shape[1] == 2:
+            dst_kv_cache_layer[pages, :, offsets, ...] = src_kv_cache.reshape(
+                2, n, *dst_kv_cache_layer.shape[3:]
+            ).transpose(0, 1)
+        else:
+            raise RuntimeError(
+                f"unrecognized paged KV layout {tuple(dst_shape)}"
+            )
 
     def _extract_kv_from_layer(self, kv_layer: Any, slot_mapping: Any, attn_metadata: Any) -> Any:
         # Index pages/offsets directly: reshaping the whole paged layer
-        # copies it when strides are not flat-contiguous (observed as a
-        # multi-GiB allocation and OOM during donor capture).
+        # copies it when strides are not flat-contiguous, and the K/V axis
+        # position varies by engine version ([2, blocks, bs, ...] vs
+        # [blocks, 2, bs, ...]) — both misreads showed up as multi-GiB
+        # allocations during donor capture.
         layer_shape = kv_layer.shape
         if self._is_mla_metadata(attn_metadata):
             page_size = layer_shape[1]
@@ -334,7 +347,16 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         page_size = layer_shape[2]
         pages = slot_mapping // page_size
         offsets = slot_mapping % page_size
-        gathered = kv_layer[:, pages, offsets, ...]
+        if layer_shape[0] == 2:
+            gathered = kv_layer[:, pages, offsets, ...]
+        elif layer_shape[1] == 2:
+            # Separated advanced indices move to the front: result is
+            # [n, 2, heads, dim]; put K/V first.
+            gathered = kv_layer[pages, :, offsets, ...].transpose(0, 1)
+        else:
+            raise RuntimeError(
+                f"unrecognized paged KV layout {tuple(layer_shape)}"
+            )
         return gathered.reshape(2, gathered.shape[1], -1)
 
     def _layer_filename(self, donor_id: str, namespace: str, layer_name: str) -> str:

@@ -194,3 +194,29 @@ def test_extract_kv_gathers_without_full_layer_copy(tmp_path) -> None:
     out = connector._extract_kv_from_layer(layer, slot_mapping, object())  # noqa: SLF001
     ref = layer.reshape(2, 24, -1)[:, slot_mapping, ...]
     torch.testing.assert_close(out, ref)
+
+
+def test_extract_and_inject_handle_blocks_first_layout(tmp_path) -> None:
+    """(take-10 regression) vLLM 0.26 stores non-MLA layers as
+    [blocks, 2, block_size, H, D]; assuming K/V-first broadcast a
+    pages-sized dimension (multi-GiB OOM). Round-trip must hold in BOTH
+    layouts."""
+    import torch
+
+    connector = _connector(tmp_path)
+    slot_mapping = torch.tensor([5, 6, 13, 21])
+
+    for layout in ("kv_first", "blocks_first"):
+        if layout == "kv_first":
+            layer = torch.randn(2, 6, 4, 2, 8)
+            ref = layer.reshape(2, 24, -1)[:, slot_mapping, ...]
+        else:
+            layer = torch.randn(6, 2, 4, 2, 8)
+            ref = layer.permute(1, 0, 2, 3, 4).reshape(2, 24, -1)[:, slot_mapping, ...]
+        out = connector._extract_kv_from_layer(layer, slot_mapping, object())  # noqa: SLF001
+        torch.testing.assert_close(out, ref, msg=layout)
+
+        dst = torch.zeros_like(layer)
+        connector._inject_kv_into_layer(dst, out, slot_mapping, object())  # noqa: SLF001
+        back = connector._extract_kv_from_layer(dst, slot_mapping, object())  # noqa: SLF001
+        torch.testing.assert_close(back, ref, msg=f"round-trip {layout}")
