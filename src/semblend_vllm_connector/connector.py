@@ -103,6 +103,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # scheduling step; the semantic lookup (embedding + alignment) is
         # request-stable, so memoize it per request (cleared on finish).
         self._lookup_cache: dict[str, Any] = {}
+        # vLLM >= 0.26: the worker registers per-layer KV cache tensors
+        # directly; layer objects no longer expose kv_cache. Load/save use
+        # this dict when populated, falling back to the forward-context walk.
+        self._registered_kv_caches: dict[str, Any] = {}
         # vllm-fork capability gate: re-consult this connector at chunked
         # continuation boundaries (mid-prompt external KV). Only the
         # semantic-span mode benefits; other modes keep stock behavior.
@@ -802,6 +806,25 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         ).reshape(n_tok, -1)
         return torch.stack((k, window[1]))
 
+    def register_kv_caches(self, kv_caches: dict) -> None:
+        self._registered_kv_caches = dict(kv_caches)
+        self._audit_event(
+            "kv_caches_registered", layer_count=len(self._registered_kv_caches)
+        )
+
+    def _iter_kv_layers(self, forward_context):
+        """Yield (layer_name, dst_kv_cache_tensor) across vLLM versions."""
+        if self._registered_kv_caches:
+            yield from self._registered_kv_caches.items()
+            return
+        for layer_name, layer in getattr(
+            forward_context, "no_compile_layers", {}
+        ).items():
+            kv_cache_attr = getattr(layer, "kv_cache", None)
+            if kv_cache_attr is None:
+                continue
+            yield layer_name, kv_cache_attr[get_virtual_engine(forward_context)]
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, SemBlendConnectorMetadata) or not metadata.loads:
@@ -832,11 +855,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     load.token_count,
                 )
             layers_materialized = 0
-            for layer_name, layer in getattr(forward_context, "no_compile_layers", {}).items():
-                kv_cache_attr = getattr(layer, "kv_cache", None)
-                if kv_cache_attr is None:
-                    continue
-                dst_kv_cache_layer = kv_cache_attr[get_virtual_engine(forward_context)]
+            for layer_name, dst_kv_cache_layer in self._iter_kv_layers(forward_context):
                 filename = self._layer_filename(load.donor_id, load.namespace, layer_name)
                 tensors = load_file(filename)
                 src_kv_cache = tensors["kv_cache"].to(dst_kv_cache_layer.device)
@@ -862,6 +881,22 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     attn_metadata,
                 )
                 layers_materialized += 1
+            if (
+                layers_materialized <= 0
+                and load.materialization_kind == MaterializationKind.SEMANTIC_SPAN
+            ):
+                # The scheduler already skipped compute for these tokens;
+                # continuing without KV would decode garbage silently.
+                self._audit_event(
+                    "runtime_materialization_failed_loud",
+                    request_id=load.request_id,
+                    donor_id=load.donor_id,
+                )
+                raise RuntimeError(
+                    "semantic-span load materialized 0 layers for "
+                    f"{load.request_id}; failing loudly instead of decoding "
+                    "over uninitialized KV"
+                )
             if layers_materialized <= 0:
                 self._stats["loads_rejected_no_kv_layers"] += 1
                 self._audit_event(
