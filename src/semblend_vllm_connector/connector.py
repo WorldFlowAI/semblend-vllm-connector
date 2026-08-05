@@ -320,15 +320,22 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         dst.reshape(dst_shape)
 
     def _extract_kv_from_layer(self, kv_layer: Any, slot_mapping: Any, attn_metadata: Any) -> Any:
+        # Index pages/offsets directly: reshaping the whole paged layer
+        # copies it when strides are not flat-contiguous (observed as a
+        # multi-GiB allocation and OOM during donor capture).
         layer_shape = kv_layer.shape
         if self._is_mla_metadata(attn_metadata):
-            num_pages = layer_shape[0]
             page_size = layer_shape[1]
-            return kv_layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]
+            pages = slot_mapping // page_size
+            offsets = slot_mapping % page_size
+            gathered = kv_layer[pages, offsets, ...]
+            return gathered.reshape(gathered.shape[0], -1)
 
-        num_pages = layer_shape[1]
         page_size = layer_shape[2]
-        return kv_layer.reshape(2, num_pages * page_size, -1)[:, slot_mapping, ...]
+        pages = slot_mapping // page_size
+        offsets = slot_mapping % page_size
+        gathered = kv_layer[:, pages, offsets, ...]
+        return gathered.reshape(2, gathered.shape[1], -1)
 
     def _layer_filename(self, donor_id: str, namespace: str, layer_name: str) -> str:
         return os.path.join(self._donor_dir(donor_id, namespace), f"{layer_name}.safetensors")

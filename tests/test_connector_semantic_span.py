@@ -178,3 +178,19 @@ def test_semantic_span_mode_enables_donor_stores(tmp_path) -> None:
     (FileNotFoundError at start_load_kv, engine death)."""
     connector = _connector(tmp_path)
     assert connector._materialization_enabled()  # noqa: SLF001
+
+
+def test_extract_kv_gathers_without_full_layer_copy(tmp_path) -> None:
+    """(take-9 regression) Extracting donor KV must gather selected slots
+    via page/offset indexing; reshaping the whole paged layer copies it
+    when strides are not flat-contiguous (multi-GiB OOM on capture)."""
+    import torch
+
+    connector = _connector(tmp_path)
+    # Non-MLA paged layer [2, pages, page_size, heads, dim]; the contract
+    # is equality with the flat-reshape reference gather.
+    layer = torch.randn(2, 6, 4, 2, 8)
+    slot_mapping = torch.tensor([5, 6, 13, 21])  # page 1/1/3/5 offsets 1/2/1/1
+    out = connector._extract_kv_from_layer(layer, slot_mapping, object())  # noqa: SLF001
+    ref = layer.reshape(2, 24, -1)[:, slot_mapping, ...]
+    torch.testing.assert_close(out, ref)
