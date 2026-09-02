@@ -84,7 +84,12 @@ def rope_cos_sin(positions, head_dim: int, rope_theta: float):
 
     inv_freq = 1.0 / (
         rope_theta
-        ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        ** (
+            torch.arange(
+                0, head_dim, 2, dtype=torch.float32, device=positions.device
+            )
+            / head_dim
+        )
     )
     freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
     return freqs.cos(), freqs.sin()
@@ -112,7 +117,7 @@ def rerotate_k(
     delta = target_start - donor_start
     # Rotation by a constant delta: the angle depends on the frequency
     # only, applied uniformly across tokens.
-    dpos = torch.full((n,), float(delta))
+    dpos = torch.full((n,), float(delta), device=k.device)
     cos, sin = rope_cos_sin(dpos, head_dim, rope_theta)
     orig_dtype = k.dtype
     kf = k.to(torch.float32)

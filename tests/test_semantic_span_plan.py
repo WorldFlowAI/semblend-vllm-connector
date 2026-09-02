@@ -74,6 +74,22 @@ class TestSupplyAtBoundary:
 
 
 class TestRerotateK:
+    def test_tables_built_on_k_device(self):
+        """(take-15 regression) The cos/sin tables were built on CPU while
+        donor K lives on the GPU, so the first non-zero-delta realization
+        raised 'Expected all tensors to be on the same device'. Meta-device
+        K reproduces the mismatch without a GPU: any CPU-born intermediate
+        poisons the op the same way."""
+        import torch
+
+        from semblend_vllm_connector.semantic_span import rerotate_k
+
+        k = torch.empty(4, 2, 16, device="meta")
+        out = rerotate_k(
+            k, donor_start=40, target_start=12, head_dim=16, rope_theta=10000.0
+        )
+        assert out.device.type == "meta"
+
     def test_rotation_composes_to_target_positions(self):
 
         import torch
