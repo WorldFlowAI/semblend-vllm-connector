@@ -3,33 +3,16 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Mapping
 
 from semblend_vllm_connector.types import ReuseMode
 
-_EXTRA_CONFIG_KEYS = (
-    "mode",
-    "provider",
-    "provider_module",
-    "provider_class",
-    "model_id",
-    "min_prompt_tokens",
-    "min_similarity",
-    "min_reuse_ratio",
-    "embedder_type",
-    "chunk_size",
-    "max_donors",
-    "register_donors",
-    "skip_when_exact_prefix_ratio_at_least",
-    "lookup_top_k",
-    "enable_prompt_text",
-    "log_decisions",
-    "audit_path",
-    "kv_storage_path",
-    "max_materialized_tokens",
-    "allow_non_identical_request_only",
-)
+
+def _extra_config_keys() -> tuple[str, ...]:
+    # Derived from the config fields so the getter path can never silently
+    # drop a key the Mapping path honors (a hand-kept list drifted twice).
+    return tuple(f.name for f in fields(SemBlendVllmConfig))
 
 
 def _get_extra_config(vllm_config: Any) -> Mapping[str, Any]:
@@ -42,7 +25,7 @@ def _get_extra_config(vllm_config: Any) -> Mapping[str, Any]:
     getter = getattr(kv_transfer_config, "get_from_extra_config", None)
     if callable(getter):
         values: dict[str, Any] = {}
-        for key in _EXTRA_CONFIG_KEYS:
+        for key in _extra_config_keys():
             value = getter(key, None)
             if value is not None:
                 values[key] = value

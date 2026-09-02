@@ -9,21 +9,29 @@ zero. The pending load carries the donor start for the re-rotation loader.
 
 from __future__ import annotations
 
-from semblend_vllm_connector._vllm_compat import KVConnectorRole
-from semblend_vllm_connector.connector import SemBlendVllmConnector
-from semblend_vllm_connector.types import (
-    MaterializationKind,
-    SemanticLookupResult,
-    SemanticSegment,
-)
+import json
+import sys
+import types
 
+import pytest
 from test_connector_discovery import (
     FakeBlocks,
     FakeCacheConfig,
+    FakeForwardContext,
     FakeKvTransferConfig,
     FakeRequest,
     FakeSchedulerOutput,
     FakeVllmConfig,
+)
+
+from semblend_vllm_connector._vllm_compat import KVConnectorRole
+from semblend_vllm_connector.connector import SemBlendVllmConnector
+from semblend_vllm_connector.types import (
+    MaterializationKind,
+    PendingLoad,
+    SemanticLookupResult,
+    SemanticSegment,
+    SemBlendConnectorMetadata,
 )
 
 
@@ -225,6 +233,123 @@ def test_extract_and_inject_handle_blocks_first_layout(tmp_path) -> None:
         connector._inject_kv_into_layer(dst, out, slot_mapping, object())  # noqa: SLF001
         back = connector._extract_kv_from_layer(dst, slot_mapping, object())  # noqa: SLF001
         torch.testing.assert_close(back, ref, msg=f"round-trip {layout}")
+
+
+def _worker_connector(tmp_path, audit_path):
+    vllm_config = FakeVllmConfig(
+        FakeKvTransferConfig(
+            {
+                "mode": "semantic_span_experimental",
+                "provider": "local",
+                "min_prompt_tokens": 4,
+                "kv_storage_path": str(tmp_path),
+                "audit_path": str(audit_path),
+            }
+        ),
+        cache_config=FakeCacheConfig(block_size=4),
+    )
+    return SemBlendVllmConnector(vllm_config, KVConnectorRole.WORKER)
+
+
+def _semantic_span_load(**overrides):
+    fields = dict(
+        request_id="r1",
+        donor_id="d1",
+        token_count=8,
+        materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+        namespace="ns",
+        block_ids=([3, 4],),
+        donor_start=40,
+        target_start=12,
+    )
+    fields.update(overrides)
+    return PendingLoad(**fields)
+
+
+def _audit_events(audit_path):
+    return [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_zero_layer_semantic_span_load_fails_loud(tmp_path, monkeypatch) -> None:
+    """(take-14 regression) A semantic-span load that yields no KV layers
+    must raise, never decline silently: the scheduler already skipped
+    compute for the advertised tokens, so a silent skip decodes garbage
+    over uninitialized blocks (the take-14 'supplied-but-not-loaded')."""
+    fake_safetensors = types.ModuleType("safetensors")
+    fake_safetensors_torch = types.ModuleType("safetensors.torch")
+    fake_safetensors_torch.load_file = lambda filename: {}  # noqa: ARG005
+    monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
+    monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
+
+    audit_path = tmp_path / "audit.jsonl"
+    connector = _worker_connector(tmp_path, audit_path)
+    connector.bind_connector_metadata(
+        SemBlendConnectorMetadata(loads=[_semantic_span_load()])
+    )
+
+    # vLLM 0.26 shape: no register_kv_caches call yet, and the context walk
+    # finds layers without a kv_cache attribute.
+    context = FakeForwardContext(
+        no_compile_layers={"layer0": types.SimpleNamespace(kv_cache=None)}
+    )
+    with pytest.raises(RuntimeError, match="materialized 0 layers"):
+        connector.start_load_kv(context)
+
+    events = {event["event"] for event in _audit_events(audit_path)}
+    assert "runtime_materialization_failed_loud" in events
+    assert "runtime_materialized" not in events
+
+
+def test_registered_kv_caches_feed_semantic_span_load(tmp_path, monkeypatch) -> None:
+    """(take-14 regression) vLLM 0.26 workers hand KV tensors to the
+    connector via register_kv_caches; layer.kv_cache is gone, so the
+    forward-context walk finds nothing. The registered dict must feed the
+    load path end to end: slice, re-rotate, inject, audit materialized."""
+    import torch
+
+    audit_path = tmp_path / "audit.jsonl"
+    connector = _worker_connector(tmp_path, audit_path)
+
+    class _HF:
+        rope_theta = 10000.0
+        head_dim = 16
+
+    connector._vllm_config.model_config.hf_config = _HF()  # noqa: SLF001
+
+    donor_kv = torch.randn(2, 100, 32)  # [2, tokens, H*D], extract contract
+    load = _semantic_span_load()
+    fake_safetensors = types.ModuleType("safetensors")
+    fake_safetensors_torch = types.ModuleType("safetensors.torch")
+    fake_safetensors_torch.load_file = lambda filename: {"kv_cache": donor_kv}  # noqa: ARG005
+    monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
+    monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
+
+    dst_layer = torch.zeros(2, 6, 4, 2, 16)  # kv_first paged [2, pages, bs, H, D]
+    connector.register_kv_caches({"model.layers.0.self_attn.attn": dst_layer})
+    connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[load]))
+
+    attn_metadata = object()
+    connector.start_load_kv(
+        FakeForwardContext(
+            attn_metadata=attn_metadata,
+            no_compile_layers={"layer0": types.SimpleNamespace(kv_cache=None)},
+        )
+    )
+
+    slot_mapping = torch.tensor([12, 13, 14, 15, 16, 17, 18, 19])  # blocks 3,4
+    injected = connector._extract_kv_from_layer(  # noqa: SLF001
+        dst_layer, slot_mapping, attn_metadata
+    )
+    expected = connector._semantic_span_slice(donor_kv, load, attn_metadata)  # noqa: SLF001
+    torch.testing.assert_close(injected, expected)
+
+    by_event = {event["event"]: event for event in _audit_events(audit_path)}
+    assert by_event["kv_caches_registered"]["layer_count"] == 1
+    assert by_event["runtime_materialized"]["layers_materialized"] == 1
 
 
 def test_extract_and_inject_round_trip_packed_content_layout(tmp_path) -> None:

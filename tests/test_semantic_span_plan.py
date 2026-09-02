@@ -75,7 +75,6 @@ class TestSupplyAtBoundary:
 
 class TestRerotateK:
     def test_rotation_composes_to_target_positions(self):
-        import math
 
         import torch
 

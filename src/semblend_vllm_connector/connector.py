@@ -12,17 +12,17 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from semblend_vllm_connector._vllm_compat import (
-    get_virtual_engine,
     KVConnectorBase_V1,
     KVConnectorRole,
+    get_virtual_engine,
 )
 from semblend_vllm_connector.config import SemBlendVllmConfig
 from semblend_vllm_connector.namespace import model_id_from_config, namespace_for_request
+from semblend_vllm_connector.provider import SemanticKvProvider, load_provider
 from semblend_vllm_connector.semantic_span import (
     block_align_spans,
     supply_at_boundary,
 )
-from semblend_vllm_connector.provider import SemanticKvProvider, load_provider
 from semblend_vllm_connector.types import (
     DonorRegistration,
     MaterializationKind,
