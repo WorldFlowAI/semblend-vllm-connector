@@ -533,15 +533,25 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             self._config.mode == ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL
             and result.segments
         ):
-            raw_spans = [
-                {
-                    "target_start": seg.target_start,
-                    "length": seg.token_count,
-                    "donor_start": seg.donor_start,
-                }
-                for seg in result.segments
-                if seg.donor_id == result.donor_id
-            ]
+            # The donor KV on disk is a block-aligned prefix of the donor's
+            # first scheduled chunk; a span reaching past it would load a
+            # short tensor and fail the engine at inject. Trim every span
+            # to the captured window (no capture -> nothing servable).
+            stored_tokens = self._stored_donor_token_count(result.donor_id, namespace)
+            raw_spans = []
+            for seg in result.segments:
+                if seg.donor_id != result.donor_id:
+                    continue
+                length = min(seg.token_count, stored_tokens - seg.donor_start)
+                if length <= 0:
+                    continue
+                raw_spans.append(
+                    {
+                        "target_start": seg.target_start,
+                        "length": length,
+                        "donor_start": seg.donor_start,
+                    }
+                )
             spans = block_align_spans(
                 raw_spans, self._block_size, self._config.min_semantic_span
             )

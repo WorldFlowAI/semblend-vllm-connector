@@ -81,6 +81,23 @@ class _ScriptedProvider:
         return True
 
 
+def _write_donor_capture(connector, request, donor_id, token_count) -> None:
+    """Record a donor KV capture of ``token_count`` tokens on disk, the
+    prerequisite the load path reads back per layer."""
+    import json
+    import os
+
+    from semblend_vllm_connector.namespace import namespace_for_request
+
+    namespace = namespace_for_request(
+        connector._config, connector._vllm_config, request  # noqa: SLF001
+    )
+    os.makedirs(connector._donor_dir(donor_id, namespace), exist_ok=True)  # noqa: SLF001
+    path = connector._donor_metadata_path(donor_id, namespace)  # noqa: SLF001
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"token_count": token_count}, f)
+
+
 def test_first_schedule_advertises_zero_when_span_is_interior(tmp_path) -> None:
     connector = _connector(tmp_path)
     connector._provider = _ScriptedProvider(_spanned_result())  # noqa: SLF001
@@ -96,6 +113,7 @@ def test_boundary_inside_span_advertises_block_aligned_tail(tmp_path) -> None:
     connector = _connector(tmp_path)
     connector._provider = _ScriptedProvider(_spanned_result())  # noqa: SLF001
     recipient = FakeRequest("r1", list(range(100)))
+    _write_donor_capture(connector, recipient, "d1", token_count=4096)
 
     # Simulate a continuation boundary at 12 (block-aligned, inside span
     # [12..88) after snapping 10->12, 90->88).
@@ -117,12 +135,55 @@ def test_mid_span_boundary_advances_donor_offset(tmp_path) -> None:
     connector = _connector(tmp_path)
     connector._provider = _ScriptedProvider(_spanned_result())  # noqa: SLF001
     recipient = FakeRequest("r1", list(range(100)))
+    _write_donor_capture(connector, recipient, "d1", token_count=4096)
 
     matched, _ = connector.get_num_new_matched_tokens(recipient, 40)
 
     assert matched == 48  # [40..88)
     load = connector._pending_loads["r1"]  # noqa: SLF001
     assert load.donor_start == 240  # 210 + (40 - 10)
+
+
+def test_span_advertisement_capped_by_stored_donor_kv(tmp_path) -> None:
+    """(take-15 pre-flight) Donor KV capture is a block-aligned prefix of
+    the FIRST scheduled chunk, so a span reaching past the captured length
+    would load a short tensor and kill the engine at inject. The advertise
+    path must trim every span to the stored capture."""
+    connector = _connector(tmp_path)
+    result = SemanticLookupResult(
+        donor_id="d1",
+        similarity=0.99,
+        reusable_token_count=80,
+        materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+        segments=[
+            SemanticSegment(
+                donor_id="d1", donor_start=10, target_start=10, token_count=80
+            )
+        ],
+    )
+    connector._provider = _ScriptedProvider(result)  # noqa: SLF001
+    recipient = FakeRequest("r1", list(range(100)))
+    _write_donor_capture(connector, recipient, "d1", token_count=40)
+
+    matched, _ = connector.get_num_new_matched_tokens(recipient, 12)
+
+    # Trimmed to donor window [10..40): 30 tokens, snapped 10->12 -> 28.
+    assert matched == 28
+    load = connector._pending_loads["r1"]  # noqa: SLF001
+    assert load.donor_start == 12
+    assert load.token_count == 28
+
+
+def test_span_advertisement_zero_without_stored_donor_kv(tmp_path) -> None:
+    """(take-15 pre-flight) A donor with no KV capture on disk has nothing
+    to load; advertising anyway dies at start_load_kv (take-8 class)."""
+    connector = _connector(tmp_path)
+    connector._provider = _ScriptedProvider(_spanned_result())  # noqa: SLF001
+    recipient = FakeRequest("r1", list(range(100)))
+
+    matched, async_load = connector.get_num_new_matched_tokens(recipient, 12)
+
+    assert (matched, async_load) == (0, False)
 
 
 def test_semantic_span_slice_rotates_k_and_preserves_v(tmp_path) -> None:
