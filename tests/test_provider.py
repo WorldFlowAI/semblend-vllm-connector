@@ -197,3 +197,55 @@ def test_semblend_provider_no_position_map_keeps_segments_none() -> None:
         )
     )
     assert result is not None and result.segments is None
+
+
+def test_semblend_provider_paraphrase_whole_span_becomes_single_segment() -> None:
+    """A paraphrase-verified pipeline result carries an identity position
+    map; the provider must emit exactly one prompt-absolute whole-span
+    segment (delta 0) so the connector serves it boundary-anchored from
+    position zero on the first schedule."""
+    from types import SimpleNamespace
+
+    from semblend_vllm_connector.types import SemanticLookupRequest
+
+    serve_len = 392
+
+    class FakePipeline:
+        def find_donor(self, **kwargs):
+            return SimpleNamespace(
+                found=True,
+                donor_id="d1",
+                similarity=0.86,
+                donor_tokens=list(range(600)),
+                reuse_ratio=serve_len / 400,
+                confidence_tier="paraphrase_verified",
+                fuzzy_confidence=0.86,
+                rejection_reason=None,
+                timings=None,
+                position_map=SimpleNamespace(
+                    donor_positions=list(range(serve_len)),
+                    target_positions=list(range(serve_len)),
+                ),
+            )
+
+    provider = SemBlendPipelineProvider.__new__(SemBlendPipelineProvider)
+    provider._pipeline = FakePipeline()  # noqa: SLF001
+    provider._config = SimpleNamespace(lookup_top_k=1)  # noqa: SLF001
+
+    result = provider.lookup(
+        SemanticLookupRequest(
+            request_id="r1",
+            token_ids=list(range(400)),
+            prompt_text="paraphrased prompt",
+            model_id="m",
+            namespace="n",
+            already_computed_tokens=0,
+        )
+    )
+
+    assert result is not None
+    assert result.segments is not None and len(result.segments) == 1
+    seg = result.segments[0]
+    assert (seg.target_start, seg.donor_start, seg.token_count) == (0, 0, serve_len)
+    assert result.reusable_token_count == serve_len
+    assert result.quality_signals["confidence_tier"] == "paraphrase_verified"
