@@ -766,10 +766,25 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         return SemBlendConnectorMetadata(loads=loads, stores=stores)
 
     def _rope_params(self) -> tuple[float, int] | None:
-        """(rope_theta, head_dim) from the model config; None when unknown."""
+        """(rope_theta, head_dim) from the model config; None when unknown.
+
+        transformers 5.x carries theta in the unified rope_parameters
+        dict instead of a flat rope_theta attribute. Scaled rope types
+        (yarn, linear, dynamic) rotate K differently from the plain
+        re-rotation the realizer applies, so anything but default
+        declines the load.
+        """
         model_config = getattr(self._vllm_config, "model_config", None)
         hf = getattr(model_config, "hf_config", None)
         theta = getattr(hf, "rope_theta", None)
+        if theta is None:
+            for attr in ("rope_parameters", "rope_scaling"):
+                rope = getattr(hf, attr, None)
+                if isinstance(rope, dict) and rope.get("rope_theta") is not None:
+                    if rope.get("rope_type", "default") != "default":
+                        return None
+                    theta = rope["rope_theta"]
+                    break
         head_dim = getattr(hf, "head_dim", None)
         if head_dim is None:
             hidden = getattr(hf, "hidden_size", None)

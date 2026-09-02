@@ -226,6 +226,37 @@ def test_semantic_span_slice_rotates_k_and_preserves_v(tmp_path) -> None:
     torch.testing.assert_close(out[1], donor_kv[1, 40:48])  # V untouched
 
 
+def test_rope_params_from_unified_rope_parameters(tmp_path) -> None:
+    """(take-15 regression) transformers 5.x moved rope_theta into the
+    hf config's rope_parameters dict and dropped the flat attribute;
+    reading only the legacy attribute declined every layer of every
+    semantic-span load (materialized 0 layers, loud engine death)."""
+    connector = _connector(tmp_path)
+
+    class _HF:
+        rope_parameters = {"rope_theta": 1000000.0, "rope_type": "default"}
+        hidden_size = 3584
+        num_attention_heads = 28
+
+    connector._vllm_config.model_config.hf_config = _HF()  # noqa: SLF001
+    assert connector._rope_params() == (1000000.0, 128)  # noqa: SLF001
+
+
+def test_rope_params_decline_non_default_rope_type(tmp_path) -> None:
+    """Scaled rope variants (yarn, linear, dynamic) rotate K differently
+    from the plain re-rotation the realizer applies; serving them would
+    place mis-rotated keys. Decline instead."""
+    connector = _connector(tmp_path)
+
+    class _HF:
+        rope_parameters = {"rope_theta": 1000000.0, "rope_type": "yarn"}
+        hidden_size = 3584
+        num_attention_heads = 28
+
+    connector._vllm_config.model_config.hf_config = _HF()  # noqa: SLF001
+    assert connector._rope_params() is None  # noqa: SLF001
+
+
 def test_semantic_span_slice_declines_without_rope_params(tmp_path) -> None:
     import torch
 
