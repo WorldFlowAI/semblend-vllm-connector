@@ -503,6 +503,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             reason=result.reason,
             latency_ms=elapsed_ms,
             already_computed_tokens=int(num_computed_tokens),
+            confidence_tier=str(
+                (result.quality_signals or {}).get("confidence_tier", "unknown")
+            ),
         )
         if self._config.log_decisions:
             logger.info(
