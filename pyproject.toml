@@ -1,6 +1,6 @@
 [project]
 name = "semblend-vllm-connector"
-version = "0.1.0"
+version = "0.2.0"
 description = "Out-of-tree vLLM KVConnector for SemBlend semantic KV donor discovery"
 readme = "README.md"
 requires-python = ">=3.10"

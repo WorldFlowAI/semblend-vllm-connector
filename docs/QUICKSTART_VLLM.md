@@ -18,7 +18,11 @@ re-consult the connector at chunk boundaries; see "Beyond stock vLLM".
 
 ```bash
 pip install "vllm==0.26.0"
-pip install "semblend>=0.3.18" semblend-vllm-connector sentence-transformers rapidfuzz
+pip install "semblend>=0.3.18" "semblend-vllm-connector>=0.2.0" sentence-transformers rapidfuzz
+# Until those versions are on PyPI, install both straight from GitHub:
+pip install "git+https://github.com/WorldFlowAI/semblend@feat/events-plus-paraphrase" \
+            "git+https://github.com/WorldFlowAI/semblend-vllm-connector" \
+            sentence-transformers rapidfuzz
 ```
 
 `semblend` provides the matching pipeline (MiniLM embeddings + token
@@ -114,12 +118,14 @@ Configuration knobs that matter for an overhead study:
 
 ## 5. Measure with SemBench
 
-[SemBench](https://github.com/WorldFlowAI/semantic-kv-cache-benchmark)
+[SemBench](https://github.com/WorldFlowAI/sembench)
 replays donor/recipient manifests against any OpenAI-compatible endpoint
-with streamed TTFT and attribution from this audit log:
+with streamed TTFT and attribution from this audit log. The
+`examples/overhead-benefit/` directory holds the exact manifests and
+scripts behind our published overhead-vs-benefit table:
 
 ```bash
-pip install sembench
+pip install "git+https://github.com/WorldFlowAI/sembench" transformers aiohttp
 python -m sembench run-live-gateway --manifest hit.jsonl --output hit-run.jsonl \
   --gateway-url http://127.0.0.1:8000 --model Qwen/Qwen2.5-7B-Instruct
 python -m sembench roi --histogram "512:0.6,2048:0.3,8192:0.1" --hit-rate-by-bucket "512:0,2048:0.1,8192:0.35"
