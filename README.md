@@ -16,7 +16,10 @@ lifecycle.
 
 ## Status
 
-Experimental, with safe defaults.
+Experimental, with safe defaults. Verified paraphrase reuse in
+`semantic_span_experimental` mode has been validated end to end on stock vLLM
+0.26 (Qwen2.5-7B, A10G) and through an llm-d gateway with semantic-affinity
+placement; start with [docs/QUICKSTART_VLLM.md](docs/QUICKSTART_VLLM.md).
 
 Default behavior is **discovery-only**:
 
@@ -116,6 +119,14 @@ backend-confirmed materialization.
 | `exact_prefix` | Only with engine-valid exact block refs | Future safe materialization path. |
 | `request_only_experimental` | Yes, exact-token-prefix blocks by default | Isolated validation mode; run with vLLM prefix caching disabled. |
 | `segmented_experimental` | Not enabled in this repo yet | Requires segmented/sparse execution and recompute-boundary support. |
+| `semantic_span_experimental` | Yes, block-aligned donor spans with RoPE re-rotation | Semantic reuse of non-identical prompts. Two lanes: **verified paraphrase** (whole-span serve gated by a fail-closed fact check; works on stock vLLM 0.26) and **interior span** (same content under a different wrapper; needs the scheduler re-consult patch in `WorldFlowAI/vllm`). See [docs/QUICKSTART_VLLM.md](docs/QUICKSTART_VLLM.md). |
+
+In `semantic_span_experimental` the connector never advertises more than the
+donor KV it actually captured: spans trim to the stored donor window, a load
+that materializes zero layers fails loudly rather than decoding over
+uninitialized blocks, and every load leaves separate `advertised` and
+`runtime_materialized` audit records so reuse is only ever counted from the
+latter.
 
 `request_only_experimental` defaults to exact-token-prefix materialization. The
 old zero-exact semantic proof behavior requires
