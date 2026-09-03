@@ -98,6 +98,15 @@ class SemBlendVllmConfig:
     kv_storage_path: str = "/tmp/semblend-vllm-kv"
     max_materialized_tokens: int = 4096
     allow_non_identical_request_only: bool = False
+    # A recipient that was served donor KV is not captured as a donor itself
+    # unless asked: the copy cost ~230 ms of the hit path at 3.5K tokens and
+    # its donor already covers the content.
+    capture_served_requests: bool = False
+    # "disk" writes per-layer safetensors under kv_storage_path; "memory"
+    # keeps donor layers in the worker's host RAM (no file I/O on capture or
+    # load) with an LRU cap on donors.
+    kv_storage_backend: str = "disk"
+    kv_memory_max_donors: int = 16
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "SemBlendVllmConfig":
@@ -170,5 +179,14 @@ class SemBlendVllmConfig:
                 "allow_non_identical_request_only",
                 "SEMBLEND_VLLM_ALLOW_NON_IDENTICAL_REQUEST_ONLY",
                 False,
+            ),
+            capture_served_requests=_read_bool(
+                extra, "capture_served_requests", "SEMBLEND_VLLM_CAPTURE_SERVED_REQUESTS", False
+            ),
+            kv_storage_backend=str(
+                extra.get("kv_storage_backend", os.environ.get("SEMBLEND_VLLM_KV_STORAGE_BACKEND", "disk"))
+            ).strip().lower(),
+            kv_memory_max_donors=_read_int(
+                extra, "kv_memory_max_donors", "SEMBLEND_VLLM_KV_MEMORY_MAX_DONORS", 16
             ),
         )

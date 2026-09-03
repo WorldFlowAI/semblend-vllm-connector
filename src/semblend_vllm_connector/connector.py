@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -107,6 +107,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # directly; layer objects no longer expose kv_cache. Load/save use
         # this dict when populated, falling back to the forward-context walk.
         self._registered_kv_caches: dict[str, Any] = {}
+        # Recipients that received a semantic load this scheduling cycle;
+        # consulted by the store builder so served requests are not captured.
+        self._served_request_ids: set[str] = set()
+        # Worker-side donor layers for kv_storage_backend="memory":
+        # storage key -> {layer_name: cpu tensor, "__token_count__": int}.
+        self._memory_store: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
         # vllm-fork capability gate: re-consult this connector at chunked
         # continuation boundaries (mid-prompt external KV). Only the
         # semantic-span mode benefits; other modes keep stock behavior.
@@ -276,6 +282,8 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         return os.path.join(self._config.kv_storage_path, self._storage_key(donor_id, namespace))
 
     def _has_stored_donor(self, donor_id: str, namespace: str) -> bool:
+        if self._storage_key(donor_id, namespace) in self._memory_store:
+            return True
         return os.path.isdir(self._donor_dir(donor_id, namespace))
 
     def _materialization_enabled(self) -> bool:
@@ -397,6 +405,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         return os.path.join(self._donor_dir(donor_id, namespace), "metadata.json")
 
     def _stored_donor_token_count(self, donor_id: str, namespace: str) -> int:
+        entry = self._memory_store.get(self._storage_key(donor_id, namespace))
+        if entry is not None:
+            return int(entry.get("__token_count__", 0))
         try:
             with open(self._donor_metadata_path(donor_id, namespace), encoding="utf-8") as f:
                 metadata = json.load(f)
@@ -717,6 +728,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             donor_start=pending.donor_start,
             target_start=pending.target_start,
         )
+        self._served_request_ids.add(request_id)
         self._audit_event(
             "load_allocated",
             request_id=request_id,
@@ -736,6 +748,14 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             token_ids = self._token_ids(new_req)
             if len(token_ids) < self._config.min_prompt_tokens:
                 continue
+            new_req_id = str(
+                getattr(new_req, "req_id", None) or getattr(new_req, "request_id", None) or ""
+            )
+            if new_req_id in self._served_request_ids:
+                self._served_request_ids.discard(new_req_id)
+                if not self._config.capture_served_requests:
+                    self._stats["capture_skipped_served"] += 1
+                    continue
 
             block_ids = _normalize_block_ids(getattr(new_req, "block_ids", None))
             if block_ids is None:
@@ -884,9 +904,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 )
             layers_materialized = 0
             for layer_name, dst_kv_cache_layer in self._iter_kv_layers(forward_context):
-                filename = self._layer_filename(load.donor_id, load.namespace, layer_name)
-                tensors = load_file(filename)
-                src_kv_cache = tensors["kv_cache"].to(dst_kv_cache_layer.device)
+                entry = self._memory_store.get(self._storage_key(load.donor_id, load.namespace))
+                if entry is not None and layer_name in entry:
+                    src_kv_cache = entry[layer_name].to(dst_kv_cache_layer.device)
+                else:
+                    filename = self._layer_filename(load.donor_id, load.namespace, layer_name)
+                    tensors = load_file(filename)
+                    src_kv_cache = tensors["kv_cache"].to(dst_kv_cache_layer.device)
                 if load.materialization_kind == MaterializationKind.SEMANTIC_SPAN:
                     src_kv_cache = self._semantic_span_slice(
                         src_kv_cache, load, attn_metadata
@@ -973,10 +997,24 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             kv_cache = self._extract_kv_from_layer(kv_layer, slot_mapping, attn_metadata)
             donor_dir = self._donor_dir(store.request_id, store.namespace)
             os.makedirs(donor_dir, exist_ok=True)
+            # The scheduler-role connector runs in another process and reads
+            # the captured length from this file for both backends.
             with open(self._donor_metadata_path(store.request_id, store.namespace), "w", encoding="utf-8") as f:
                 json.dump({"token_count": actual_token_count}, f)
+            host_kv = kv_cache.detach().contiguous().cpu()
+            if self._config.kv_storage_backend == "memory":
+                key = self._storage_key(store.request_id, store.namespace)
+                entry = self._memory_store.get(key)
+                if entry is None:
+                    entry = {"__token_count__": actual_token_count}
+                    self._memory_store[key] = entry
+                    while len(self._memory_store) > max(1, self._config.kv_memory_max_donors):
+                        self._memory_store.popitem(last=False)
+                        self._stats["memory_store_evictions"] += 1
+                entry[layer_name] = host_kv
+                continue
             save_file(
-                {"kv_cache": kv_cache.detach().contiguous().cpu()},
+                {"kv_cache": host_kv},
                 self._layer_filename(store.request_id, store.namespace, layer_name),
             )
 
