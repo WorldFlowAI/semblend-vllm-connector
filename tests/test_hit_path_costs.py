@@ -169,7 +169,7 @@ def test_memory_backend_round_trips_without_files(tmp_path, monkeypatch):
     want = connector._extract_kv_from_layer(src_layer, src_slots, object())  # noqa: SLF001
     torch.testing.assert_close(got, want)
 
-    events = [json.loads(l)["event"] for l in open(tmp_path / "audit.jsonl") if l.strip()]
+    events = [json.loads(line)["event"] for line in open(tmp_path / "audit.jsonl") if line.strip()]
     assert "runtime_materialized" in events
 
 
