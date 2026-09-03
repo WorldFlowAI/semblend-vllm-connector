@@ -153,3 +153,14 @@ mix; replace its default coefficients with the numbers from your run.
   block size, dtype, LoRA, and the request's `cache_salt` (vLLM's own
   prefix-cache isolation key). Set `cache_salt` per tenant and a request
   never sees another tenant's donors.
+
+## Prefix caching and served requests
+
+A request that received a semantic load holds approximate KV for the
+served span. vLLM's prefix cache hashes blocks by token content, so with
+`--enable-prefix-caching` a later request whose token prefix matches a
+served request could receive the donor's KV through an exact-prefix hit.
+Until the connector marks served blocks as non-cacheable, run
+`semantic_span_experimental` with prefix caching disabled
+(`--no-enable-prefix-caching`), or isolate tenants with `cache_salt` so
+an exact-prefix hit can only come from the same tenant's own requests.
