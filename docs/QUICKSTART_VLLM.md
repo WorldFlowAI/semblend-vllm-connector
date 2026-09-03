@@ -144,4 +144,6 @@ mix; replace its default coefficients with the numbers from your run.
   holding their donor. The connector publishes donor events over NATS
   when `SEMBLEND_NATS_URL` is set.
 - **Tenancy**: donors and lookups are namespaced by model, tokenizer,
-  block size, and tenant; a request never sees another tenant's donors.
+  block size, dtype, LoRA, and the request's `cache_salt` (vLLM's own
+  prefix-cache isolation key). Set `cache_salt` per tenant and a request
+  never sees another tenant's donors.
