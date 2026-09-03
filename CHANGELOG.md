@@ -5,7 +5,15 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
-## Unreleased
+## 0.2.1 (unreleased)
+
+- Recipients that received a semantic load are no longer captured as
+  donors by default (`capture_served_requests` restores the old behavior).
+  Capture was ~230 ms of the hit path at 3.5K tokens.
+- `kv_storage_backend=memory` keeps donor layers in the worker's host RAM
+  under an LRU cap (`kv_memory_max_donors`), so loads never touch disk.
+
+## 0.2.0 - 2026-09-03
 
 - `semantic_span_experimental` mode: block-aligned donor spans advertised at
   the scheduler's computed boundary and realized with K re-rotation into the

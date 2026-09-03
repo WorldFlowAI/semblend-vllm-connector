@@ -196,3 +196,50 @@ def test_memory_backend_evicts_oldest(tmp_path, monkeypatch):
     keys = list(connector._memory_store.keys())  # noqa: SLF001
     assert len(keys) == 2
     assert connector._storage_key("a", "ns") not in keys  # noqa: SLF001
+
+
+def test_load_materializes_on_a_no_forward_step(tmp_path, monkeypatch):
+    """vLLM issues a no-forward step (forward_context.attn_metadata is None)
+    when a step carries loads but no tokens to compute, which happens under
+    concurrent long prefills. The scheduler already counts the span as
+    computed, so refusing to materialize there killed the engine
+    ("SemBlend materialization requires forward_context.attn_metadata")."""
+    import torch
+
+    fake_st = types.ModuleType("safetensors")
+    fake_st_torch = types.ModuleType("safetensors.torch")
+    fake_st_torch.save_file = lambda *a, **k: None
+    fake_st_torch.load_file = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no disk"))
+    monkeypatch.setitem(sys.modules, "safetensors", fake_st)
+    monkeypatch.setitem(sys.modules, "safetensors.torch", fake_st_torch)
+    connector = SemBlendVllmConnector(
+        _config(tmp_path, kv_storage_backend="memory", kv_memory_max_donors=4), KVConnectorRole.WORKER
+    )
+
+    class _HF:
+        rope_theta = 10000.0
+        head_dim = 16
+
+    connector._vllm_config.model_config.hf_config = _HF()  # noqa: SLF001
+    layer_name = "model.layers.0.self_attn.attn"
+    src_layer = torch.randn(2, 6, 4, 2, 16)
+    connector.register_kv_caches({layer_name: src_layer})
+    from semblend_vllm_connector.types import PendingStore
+
+    store = PendingStore(request_id="d1", token_ids=list(range(8)), token_count=8, namespace="ns", block_ids=([0, 1],))
+    connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[], stores=[store]))
+    connector.save_kv_layer(layer_name, src_layer, object())
+
+    dst_layer = torch.zeros_like(src_layer)
+    connector.register_kv_caches({layer_name: dst_layer})
+    load = PendingLoad(
+        request_id="r1", donor_id="d1", token_count=8, materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+        namespace="ns", block_ids=([3, 4],), donor_start=0, target_start=0,
+    )
+    connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[load], stores=[]))
+    connector.start_load_kv(FakeForwardContext(attn_metadata=None))
+
+    got = connector._extract_kv_from_layer(dst_layer, torch.tensor(list(range(12, 20))), object())  # noqa: SLF001
+    want = connector._extract_kv_from_layer(src_layer, torch.tensor(list(range(8))), object())  # noqa: SLF001
+    torch.testing.assert_close(got, want)
+    assert connector.stats_snapshot.get("materialized_without_forward") == 1

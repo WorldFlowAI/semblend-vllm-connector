@@ -113,6 +113,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # Worker-side donor layers for kv_storage_backend="memory":
         # storage key -> {layer_name: cpu tensor, "__token_count__": int}.
         self._memory_store: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        self._last_attn_metadata: Any = None
         # vllm-fork capability gate: re-consult this connector at chunked
         # continuation boundaries (mid-prompt external KV). Only the
         # semantic-span mode benefits; other modes keep stock behavior.
@@ -882,7 +883,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
         attn_metadata = getattr(forward_context, "attn_metadata", None)
         if attn_metadata is None:
-            raise RuntimeError("SemBlend materialization requires forward_context.attn_metadata")
+            # vLLM runs a no-forward step (kv_connector.no_forward) when a
+            # scheduling step has loads but no tokens to compute, common under
+            # concurrent long prefills. The scheduler has already counted the
+            # span as computed, so the load must happen now; attn_metadata is
+            # only consulted for the MLA layout check, which stays as last seen.
+            attn_metadata = self._last_attn_metadata
+            self._stats["materialized_without_forward"] += 1
+        else:
+            self._last_attn_metadata = attn_metadata
 
         for load in metadata.loads:
             if load.block_ids is None:
