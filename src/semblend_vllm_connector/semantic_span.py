@@ -69,6 +69,13 @@ def supply_at_boundary(
     servable from ``boundary``, or (0, None) when the boundary is not
     inside any donor span. An unaligned boundary snaps the usable start up
     to the next block edge; the donor start advances by the tokens skipped.
+
+    The returned count is measured from ``usable_from``, NOT from
+    ``boundary``. A caller that adds it to ``boundary`` (as vLLM's scheduler
+    does with what the match hook returns) is only correct when the two
+    coincide, i.e. when ``boundary`` is already block-aligned; off an aligned
+    boundary the tokens in between would be counted as computed and never
+    written.
     """
     usable_from = ((boundary + block_size - 1) // block_size) * block_size
     for span in spans:

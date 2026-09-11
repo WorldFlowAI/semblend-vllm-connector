@@ -87,6 +87,11 @@ class PendingLoad:
     token_count: int
     materialization_kind: MaterializationKind
     namespace: str
+    # The request's COMPLETE per-group block list from token 0, exactly as the
+    # scheduler supplies it, so absolute token position p is addressed by
+    # block_ids[group][p // block_size]. A caller passing a list trimmed to the
+    # served window would shift every destination back to the request's shared
+    # prefix blocks and overwrite them.
     block_ids: tuple[list[int], ...] | None = None
     # Semantic-span loads: donor- and target-side positions of the first
     # served token, consumed by the re-rotation loader (delta = target -

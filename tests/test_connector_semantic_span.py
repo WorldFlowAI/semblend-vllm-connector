@@ -140,8 +140,14 @@ def test_mid_span_boundary_advances_donor_offset(tmp_path) -> None:
     matched, _ = connector.get_num_new_matched_tokens(recipient, 40)
 
     assert matched == 48  # [40..88)
-    load = connector._pending_loads["r1"]  # noqa: SLF001
+
+    # The match hook is side-effect free, so the donor offset it computed is
+    # only observable once the scheduler has allocated destination blocks.
+    connector.update_state_after_alloc(recipient, FakeBlocks((list(range(22)),)), matched)
+    load = connector.build_connector_meta(FakeSchedulerOutput()).loads[0]
     assert load.donor_start == 240  # 210 + (40 - 10)
+    assert load.token_count == 48
+    assert load.target_start == 40
 
 
 def test_span_advertisement_capped_by_stored_donor_kv(tmp_path) -> None:
@@ -169,7 +175,9 @@ def test_span_advertisement_capped_by_stored_donor_kv(tmp_path) -> None:
 
     # Trimmed to donor window [10..40): 30 tokens, snapped 10->12 -> 28.
     assert matched == 28
-    load = connector._pending_loads["r1"]  # noqa: SLF001
+
+    connector.update_state_after_alloc(recipient, FakeBlocks((list(range(10)),)), matched)
+    load = connector.build_connector_meta(FakeSchedulerOutput()).loads[0]
     assert load.donor_start == 12
     assert load.token_count == 28
 
@@ -350,7 +358,12 @@ def _semantic_span_load(**overrides):
         token_count=8,
         materialization_kind=MaterializationKind.SEMANTIC_SPAN,
         namespace="ns",
-        block_ids=([3, 4],),
+        # The request's complete block list from token 0, indexed by absolute
+        # token position: block_size 4, target_start 12, so the served span
+        # [12, 20) lands in the entries at index 3 and 4. The three leading
+        # blocks are deliberately not the identity mapping, so a destination
+        # built from block index 0 is distinguishable from this one.
+        block_ids=([7, 2, 9, 3, 4],),
         donor_start=40,
         target_start=12,
     )
@@ -420,7 +433,7 @@ def test_registered_kv_caches_feed_semantic_span_load(tmp_path, monkeypatch) -> 
     monkeypatch.setitem(sys.modules, "safetensors", fake_safetensors)
     monkeypatch.setitem(sys.modules, "safetensors.torch", fake_safetensors_torch)
 
-    dst_layer = torch.zeros(2, 6, 4, 2, 16)  # kv_first paged [2, pages, bs, H, D]
+    dst_layer = torch.zeros(2, 10, 4, 2, 16)  # kv_first paged [2, pages, bs, H, D]
     connector.register_kv_caches({"model.layers.0.self_attn.attn": dst_layer})
     connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[load]))
 
@@ -432,7 +445,9 @@ def test_registered_kv_caches_feed_semantic_span_load(tmp_path, monkeypatch) -> 
         )
     )
 
-    slot_mapping = torch.tensor([12, 13, 14, 15, 16, 17, 18, 19])  # blocks 3,4
+    # Target [12, 20) -> block-list entries 3 and 4, i.e. physical blocks 3
+    # and 4, i.e. slots 12..19.
+    slot_mapping = torch.tensor([12, 13, 14, 15, 16, 17, 18, 19])
     injected = connector._extract_kv_from_layer(  # noqa: SLF001
         dst_layer, slot_mapping, attn_metadata
     )
