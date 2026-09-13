@@ -67,7 +67,7 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct \
     "kv_connector_extra_config": {
       "mode": "discovery_only",
       "provider": "local",
-      "min_prompt_tokens": 256,
+      "min_prompt_tokens": 512,
       "min_similarity": 0.70
     }
   }'
@@ -84,7 +84,7 @@ SemBlend provider mode:
   "kv_connector_extra_config": {
     "mode": "discovery_only",
     "provider": "semblend",
-    "min_prompt_tokens": 256,
+    "min_prompt_tokens": 512,
     "min_similarity": 0.70,
     "min_reuse_ratio": 0.50,
     "embedder_type": "minilm",

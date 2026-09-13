@@ -1,9 +1,22 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+import os
+from dataclasses import dataclass, field, fields
+
+import pytest
 
 from semblend_vllm_connector.config import SemBlendVllmConfig
 from semblend_vllm_connector.types import ReuseMode
+
+
+@pytest.fixture(autouse=True)
+def _clean_semblend_env(monkeypatch) -> None:
+    # Every test here asserts a default or an explicit value; an operator's
+    # shell exporting SEMBLEND_VLLM_* would silently change the answer.
+    for name in list(os.environ):
+        if name.startswith("SEMBLEND_VLLM_"):
+            monkeypatch.delenv(name)
 
 
 @dataclass
@@ -123,7 +136,14 @@ def test_getter_path_carries_every_config_field() -> None:
         "kv_storage_path": "/tmp/kv",
         "max_materialized_tokens": 2048,
         "allow_non_identical_request_only": "true",
+        "capture_served_requests": "true",
+        "kv_storage_backend": "MEMORY",
+        "kv_memory_max_donors": 3,
+        "min_boundary_tokens": 16,
     }
+    # A field added to the config without a line here is exactly the drift
+    # this test exists to catch.
+    assert set(supplied) == {f.name for f in fields(SemBlendVllmConfig)}
     cfg = SemBlendVllmConfig.from_vllm_config(
         FakeVllmConfig(FakeGetterKvTransferConfig(dict(supplied)))
     )
@@ -147,3 +167,94 @@ def test_getter_path_carries_every_config_field() -> None:
     assert cfg.provider_class == "XProvider"
     assert cfg.model_id == "m"
     assert cfg.embedder_type == "minilm"
+    assert cfg.capture_served_requests is True
+    assert cfg.kv_storage_backend == "memory"
+    assert cfg.kv_memory_max_donors == 3
+    assert cfg.min_boundary_tokens == 16
+
+
+def test_env_path_defaults_match_dataclass_defaults() -> None:
+    """The defaults are written twice (field default and the from_vllm_config
+    fallback); a value changed in one place only is a config that reads
+    differently depending on how it was built.
+    """
+    from_env = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
+    assert from_env == SemBlendVllmConfig(model_id="test-model")
+
+
+def test_default_min_prompt_tokens_can_carry_a_span() -> None:
+    """A default gap between min_prompt_tokens and min_semantic_span admits
+    prompts to lookup that block_align_spans can never serve.
+    """
+    cfg = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
+    assert cfg.min_prompt_tokens == 512
+    assert cfg.min_prompt_tokens >= cfg.min_semantic_span
+    assert cfg.validation_warnings() == ()
+
+
+def test_semantic_span_mode_warns_when_min_prompt_tokens_is_below_min_semantic_span(
+    caplog,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="semblend_vllm_connector"):
+        cfg = SemBlendVllmConfig.from_vllm_config(
+            FakeVllmConfig(
+                FakeKvTransferConfig(
+                    {
+                        "mode": "semantic_span_experimental",
+                        "min_prompt_tokens": 256,
+                        "min_semantic_span": 512,
+                    }
+                )
+            )
+        )
+    # Legal but self-defeating: the config is built, the operator is told.
+    assert cfg.min_prompt_tokens == 256
+    (message,) = cfg.validation_warnings()
+    assert "min_prompt_tokens=256" in message
+    assert "min_semantic_span=512" in message
+    logged = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(message in r.getMessage() for r in logged), "inconsistency was not logged"
+
+
+def test_min_prompt_tokens_gap_is_silent_where_min_semantic_span_is_inert(caplog) -> None:
+    """min_semantic_span only gates the semantic-span path; the same gap in
+    exact_prefix mode costs nothing and must not nag."""
+    with caplog.at_level(logging.WARNING, logger="semblend_vllm_connector"):
+        cfg = SemBlendVllmConfig.from_vllm_config(
+            FakeVllmConfig(
+                FakeKvTransferConfig(
+                    {"mode": "exact_prefix", "min_prompt_tokens": 256, "min_semantic_span": 512}
+                )
+            )
+        )
+    assert cfg.validation_warnings() == ()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_min_boundary_tokens_defaults_off() -> None:
+    cfg = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
+    assert cfg.min_boundary_tokens == 0
+
+
+def test_min_boundary_tokens_reads_extra_config() -> None:
+    cfg = SemBlendVllmConfig.from_vllm_config(
+        FakeVllmConfig(FakeKvTransferConfig({"min_boundary_tokens": "16"}))
+    )
+    assert cfg.min_boundary_tokens == 16
+
+
+def test_min_boundary_tokens_reads_env_and_extra_config_wins(monkeypatch) -> None:
+    monkeypatch.setenv("SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", "32")
+    from_env = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
+    assert from_env.min_boundary_tokens == 32
+
+    explicit = SemBlendVllmConfig.from_vllm_config(
+        FakeVllmConfig(FakeKvTransferConfig({"min_boundary_tokens": 16}))
+    )
+    assert explicit.min_boundary_tokens == 16
+
+
+def test_min_boundary_tokens_unparseable_falls_back_to_default(monkeypatch) -> None:
+    monkeypatch.setenv("SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", "one-block")
+    cfg = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
+    assert cfg.min_boundary_tokens == 0

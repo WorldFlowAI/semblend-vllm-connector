@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, fields
 from typing import Any, Mapping
 
 from semblend_vllm_connector.types import ReuseMode
+
+logger = logging.getLogger("semblend_vllm_connector")
 
 
 def _extra_config_keys() -> tuple[str, ...]:
@@ -82,8 +85,24 @@ class SemBlendVllmConfig:
     provider_module: str | None = None
     provider_class: str | None = None
     model_id: str | None = None
-    min_prompt_tokens: int = 256
+    # Prompts shorter than this never reach lookup or capture. Kept at or
+    # above min_semantic_span: in semantic-span mode a prompt in the gap is
+    # admitted to lookup but block_align_spans can never carve a servable
+    # span out of it, so the lookup is pure miss tax (validation_warnings).
+    min_prompt_tokens: int = 512
     min_semantic_span: int = 512
+    # Lowest local prefix-cache boundary (num_computed_tokens) at which the
+    # connector will serve; below it the request is declined and the engine
+    # prefills it. 0 disables the gate. Why it exists: blocks the connector
+    # fills hold donor KV hashed under the recipient's own token ids, so they
+    # have to be kept out of vLLM's prefix cache. A request served from
+    # boundary 0 therefore contributes nothing to that cache; if every
+    # servable request is served that way, the shared leading prompt is never
+    # cached and the boundary stays 0 for good. Set to block_size so unserved
+    # requests prime the shared prefix cleanly; it also keeps a boundary-
+    # alignment measurement from counting boundary-0 serves. Only parsed
+    # here; the match-hook gate that consumes it is wired separately.
+    min_boundary_tokens: int = 0
     min_similarity: float = 0.70
     min_reuse_ratio: float = 0.50
     embedder_type: str | None = None
@@ -107,6 +126,32 @@ class SemBlendVllmConfig:
     # load) with an LRU cap on donors.
     kv_storage_backend: str = "disk"
     kv_memory_max_donors: int = 16
+
+    def validation_warnings(self) -> tuple[str, ...]:
+        """Knob combinations that are legal but self-defeating.
+
+        Returned rather than raised: none of them is a correctness hazard
+        (the affected requests decline, and every decline is counted), and
+        a threshold sweep may open the gap on purpose to measure its cost.
+        """
+        warnings: list[str] = []
+        # block_align_spans only runs on the semantic-span path; in the other
+        # modes min_semantic_span is inert and the gap costs nothing.
+        if (
+            self.mode == ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL
+            and self.min_prompt_tokens < self.min_semantic_span
+        ):
+            warnings.append(
+                f"min_prompt_tokens={self.min_prompt_tokens} is below "
+                f"min_semantic_span={self.min_semantic_span}: prompts in that range "
+                "are admitted to lookup but can never carry a servable span, so "
+                "each of those lookups is a guaranteed miss"
+            )
+        return tuple(warnings)
+
+    def __post_init__(self) -> None:
+        for message in self.validation_warnings():
+            logger.warning("SemBlend config: %s", message)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "SemBlendVllmConfig":
@@ -135,8 +180,11 @@ class SemBlendVllmConfig:
             or os.environ.get("SEMBLEND_VLLM_PROVIDER_MODULE"),
             provider_class=extra.get("provider_class") or os.environ.get("SEMBLEND_VLLM_PROVIDER_CLASS"),
             model_id=str(model_id) if model_id is not None else None,
-            min_prompt_tokens=_read_int(extra, "min_prompt_tokens", "SEMBLEND_VLLM_MIN_PROMPT_TOKENS", 256),
+            min_prompt_tokens=_read_int(extra, "min_prompt_tokens", "SEMBLEND_VLLM_MIN_PROMPT_TOKENS", 512),
             min_semantic_span=_read_int(extra, "min_semantic_span", "SEMBLEND_VLLM_MIN_SEMANTIC_SPAN", 512),
+            min_boundary_tokens=_read_int(
+                extra, "min_boundary_tokens", "SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", 0
+            ),
             min_similarity=_read_float(extra, "min_similarity", "SEMBLEND_VLLM_MIN_SIMILARITY", 0.70),
             min_reuse_ratio=_read_float(
                 extra, "min_reuse_ratio", "SEMBLEND_VLLM_MIN_REUSE_RATIO", 0.50

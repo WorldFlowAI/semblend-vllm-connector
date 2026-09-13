@@ -9,6 +9,7 @@ import os
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from semblend_vllm_connector._vllm_compat import (
@@ -43,6 +44,26 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("semblend_vllm_connector")
+
+# Per-donor length record the scheduler role reads from disk under both
+# storage backends; retracted on eviction so it never outlives the tensors.
+_DONOR_METADATA_FILENAME = "metadata.json"
+
+
+@dataclass(frozen=True)
+class _CaptureState:
+    """A donor still in prefill, as the scheduler role carries it across steps.
+
+    The cached-request diff vLLM sends after admission has no token ids and
+    only the blocks added that step, so the running table and the prompt are
+    kept here. ``captured_end`` is the block-aligned position the last emitted
+    store reached; a later chunk only produces a store when it moves it.
+    """
+
+    token_ids: list[int]
+    block_ids: tuple[list[int], ...]
+    namespace: str
+    captured_end: int
 
 
 def _cacheable_prefix_tokens(num_tokens: int, block_size: int) -> int:
@@ -169,8 +190,28 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # consulted by the store builder so served requests are not captured.
         self._served_request_ids: set[str] = set()
         # Worker-side donor layers for kv_storage_backend="memory":
-        # storage key -> {layer_name: cpu tensor, "__token_count__": int}.
+        # storage key -> {layer_name: cpu tensor, "__token_count__": int,
+        # "__request_id__": str}, in access order so the cap evicts the least
+        # recently used donor. This backend is the only one that evicts, so
+        # it is the only way the scheduler role (another process, reading
+        # metadata.json) can be left advertising tensors that are gone; the
+        # eviction path retracts that file for exactly this reason. A "disk"
+        # backend with kv_storage_path on tmpfs (e.g. /dev/shm) keeps the
+        # cross-process truth in one place at memory speed and is the
+        # recommended setup.
         self._memory_store: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+        # Worker-side capture progress: request id -> {layer_name: tokens
+        # captured so far}. Chunked prefill computes a donor one prefix chunk
+        # per step, so a capture is a sequence of appends and each layer has
+        # to know where its own copy ends (save_kv_layer is per layer).
+        self._capture_progress: dict[str, dict[str, int]] = {}
+        # Destination blocks of loads declined on this worker after the
+        # scheduler had already credited them; drained by vLLM each forward
+        # so the engine recomputes them under kv_load_failure_policy.
+        self._load_error_block_ids: set[int] = set()
+        # Scheduler-side state for donors still in prefill, so the chunks
+        # after admission can be captured too.
+        self._capture_state: dict[str, _CaptureState] = {}
         self._last_attn_metadata: Any = None
         # vllm-fork capability gate: re-consult this connector at chunked
         # continuation boundaries (mid-prompt external KV). Only the
@@ -523,8 +564,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         raw = f"{namespace}:{donor_id}".encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
 
+    def _donor_dir_for_key(self, storage_key: str) -> str:
+        return os.path.join(self._config.kv_storage_path, storage_key)
+
     def _donor_dir(self, donor_id: str, namespace: str) -> str:
-        return os.path.join(self._config.kv_storage_path, self._storage_key(donor_id, namespace))
+        return self._donor_dir_for_key(self._storage_key(donor_id, namespace))
 
     def _has_stored_donor(self, donor_id: str, namespace: str) -> bool:
         if self._storage_key(donor_id, namespace) in self._memory_store:
@@ -540,6 +584,20 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             ReuseMode.SEGMENTED_EXPERIMENTAL,
             ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL,
         }
+
+    def _destination_block_ids(self, load: PendingLoad) -> set[int]:
+        """Blocks a load would have written, in the request's own block list."""
+        if not load.block_ids or not load.block_ids[0]:
+            return set()
+        target_start = load.target_start or 0
+        start_block = target_start // self._block_size
+        end_block = -(-(target_start + load.token_count) // self._block_size)
+        return {int(b) for b in load.block_ids[0][start_block:end_block]}
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        # Sync loading: report in the forward pass the failure was detected.
+        failed, self._load_error_block_ids = self._load_error_block_ids, set()
+        return failed
 
     def _slot_mapping(
         self,
@@ -823,11 +881,14 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         return os.path.join(self._donor_dir(donor_id, namespace), f"{layer_name}.safetensors")
 
     def _donor_metadata_path(self, donor_id: str, namespace: str) -> str:
-        return os.path.join(self._donor_dir(donor_id, namespace), "metadata.json")
+        return os.path.join(self._donor_dir(donor_id, namespace), _DONOR_METADATA_FILENAME)
 
     def _stored_donor_token_count(self, donor_id: str, namespace: str) -> int:
-        entry = self._memory_store.get(self._storage_key(donor_id, namespace))
+        storage_key = self._storage_key(donor_id, namespace)
+        entry = self._memory_store.get(storage_key)
         if entry is not None:
+            # A read is a use: without it the cap evicts in arrival order.
+            self._memory_store.move_to_end(storage_key)
             return int(entry.get("__token_count__", 0))
         try:
             with open(self._donor_metadata_path(donor_id, namespace), encoding="utf-8") as f:
@@ -1356,45 +1417,181 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
     def _build_store_metadata(self, scheduler_output: "SchedulerOutput") -> list[PendingStore]:
         if not self._materialization_enabled():
             return []
+        for finished_id in getattr(scheduler_output, "finished_req_ids", None) or ():
+            self._capture_state.pop(str(finished_id), None)
+        scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
+        return [
+            *self._capture_admitted(scheduler_output, scheduled_tokens),
+            *self._capture_continuations(scheduler_output, scheduled_tokens),
+        ]
 
+    def _capture_admitted(
+        self, scheduler_output: "SchedulerOutput", scheduled_tokens: Mapping[str, int] | None
+    ) -> list[PendingStore]:
+        """Open a capture for each request scheduled for the first time."""
         stores: list[PendingStore] = []
         for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             token_ids = self._token_ids(new_req)
             if len(token_ids) < self._config.min_prompt_tokens:
                 continue
-            new_req_id = str(
-                getattr(new_req, "req_id", None) or getattr(new_req, "request_id", None) or ""
-            )
-            if new_req_id in self._served_request_ids:
-                self._served_request_ids.discard(new_req_id)
-                if not self._config.capture_served_requests:
-                    self._stats["capture_skipped_served"] += 1
-                    continue
-
-            block_ids = _normalize_block_ids(getattr(new_req, "block_ids", None))
-            if block_ids is None:
-                continue
-
-            token_count = _cacheable_prefix_tokens(len(token_ids), self._block_size)
-            token_count = min(token_count, len(block_ids[0]) * self._block_size)
-            if token_count <= 0:
-                continue
-
             request_id = str(
                 getattr(new_req, "req_id", None)
                 or getattr(new_req, "request_id", None)
                 or "unknown-request"
             )
-            stores.append(
-                PendingStore(
-                    request_id=request_id,
-                    token_ids=token_ids,
-                    token_count=token_count,
-                    namespace=namespace_for_request(self._config, self._vllm_config, new_req),
-                    block_ids=block_ids,
-                )
+            if not self._capture_allowed(request_id):
+                continue
+            block_ids = _normalize_block_ids(getattr(new_req, "block_ids", None))
+            if block_ids is None:
+                continue
+            state = _CaptureState(
+                token_ids=token_ids,
+                block_ids=block_ids,
+                namespace=namespace_for_request(self._config, self._vllm_config, new_req),
+                captured_end=0,
             )
+            # num_computed_tokens is the local prefix hit (plus anything a
+            # connector served), already valid in the shared blocks; the
+            # forward pass adds num_scheduled_tokens on top of it.
+            computed_end = self._computed_end(
+                request_id,
+                int(getattr(new_req, "num_computed_tokens", 0) or 0),
+                len(token_ids),
+                scheduled_tokens,
+            )
+            store = self._advance_capture(request_id, state, computed_end)
+            if store is not None:
+                stores.append(store)
         return stores
+
+    def _capture_continuations(
+        self, scheduler_output: "SchedulerOutput", scheduled_tokens: Mapping[str, int] | None
+    ) -> list[PendingStore]:
+        """Extend open captures with the chunks scheduled after admission."""
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is None or not self._capture_state:
+            return []
+        # For ids in resumed_req_ids the diff is the whole block table, not
+        # an addition to it (vLLM SchedulerOutput.CachedRequestData).
+        resumed = {str(req_id) for req_id in getattr(cached, "resumed_req_ids", None) or ()}
+        rows = zip(
+            cached.req_ids,
+            cached.new_block_ids,
+            cached.num_computed_tokens,
+            cached.num_output_tokens,
+            strict=True,
+        )
+        stores: list[PendingStore] = []
+        for req_id, new_block_ids, num_computed_tokens, num_output_tokens in rows:
+            request_id = str(req_id)
+            state = self._capture_state.get(request_id)
+            if state is None:
+                continue
+            if not self._capture_allowed(request_id):
+                self._capture_state.pop(request_id, None)
+                continue
+            if int(num_output_tokens or 0) > 0:
+                # Decode: the prompt is fully computed, so a capture still
+                # open here is short of its cap for good (the block table
+                # never covered it); close it so the entry does not linger.
+                self._stats["capture_closed_short_at_decode"] += 1
+                self._capture_state.pop(request_id, None)
+                continue
+            block_ids = self._extend_block_table(
+                state.block_ids,
+                _normalize_block_ids(new_block_ids),
+                replace_table=request_id in resumed,
+            )
+            computed_end = self._computed_end(
+                request_id, int(num_computed_tokens or 0), len(state.token_ids), scheduled_tokens
+            )
+            store = self._advance_capture(
+                request_id, replace(state, block_ids=block_ids), computed_end
+            )
+            if store is not None:
+                stores.append(store)
+        return stores
+
+    def _capture_allowed(self, request_id: str) -> bool:
+        """Whether a request served by this connector may be captured too.
+
+        The served set is consumed here: a request is served once, and the
+        decision must be taken on the step the load landed.
+        """
+        if request_id not in self._served_request_ids:
+            return True
+        self._served_request_ids.discard(request_id)
+        if self._config.capture_served_requests:
+            return True
+        self._stats["capture_skipped_served"] += 1
+        return False
+
+    def _computed_end(
+        self,
+        request_id: str,
+        num_computed_tokens: int,
+        prompt_tokens: int,
+        scheduled_tokens: Mapping[str, int] | None,
+    ) -> int:
+        """Prompt position computed once this step's forward pass has run."""
+        if scheduled_tokens is None:
+            # Stock vLLM always carries num_scheduled_tokens; only a stub
+            # engine omits it. Assume the whole prompt, and keep the
+            # unclamped capture visible in the stats.
+            self._stats["capture_unclamped_no_schedule_info"] += 1
+            return prompt_tokens
+        return num_computed_tokens + int(scheduled_tokens.get(request_id, 0) or 0)
+
+    @staticmethod
+    def _extend_block_table(
+        current: tuple[list[int], ...],
+        added: tuple[list[int], ...] | None,
+        *,
+        replace_table: bool,
+    ) -> tuple[list[int], ...]:
+        if added is None:
+            return current
+        if replace_table:
+            return added
+        return tuple([*old, *new] for old, new in zip(current, added, strict=True))
+
+    def _advance_capture(
+        self, request_id: str, state: _CaptureState, computed_end: int
+    ) -> PendingStore | None:
+        """The store that extends this donor to what is now computed, if any.
+
+        The capture is clamped to whole blocks the forward pass has actually
+        filled: under chunked prefill the admission step computes at most
+        max_num_batched_tokens (shared across co-scheduled requests), and a
+        capture sized from the prompt alone publishes uninitialized KV as the
+        donor's authoritative length. Later chunks append from the running
+        offset. The state is dropped once the prompt's cacheable prefix is
+        captured in full.
+        """
+        prompt_cap = _cacheable_prefix_tokens(len(state.token_ids), self._block_size)
+        if prompt_cap <= 0:
+            self._capture_state.pop(request_id, None)
+            return None
+        end = min(
+            prompt_cap,
+            len(state.block_ids[0]) * self._block_size,
+            (computed_end // self._block_size) * self._block_size,
+        )
+        if end <= state.captured_end:
+            # Nothing new is block-complete yet; keep the running table.
+            self._capture_state[request_id] = state
+            return None
+        if end >= prompt_cap:
+            self._capture_state.pop(request_id, None)
+        else:
+            self._capture_state[request_id] = replace(state, captured_end=end)
+        return PendingStore(
+            request_id=request_id,
+            token_ids=state.token_ids,
+            token_count=end,
+            namespace=state.namespace,
+            block_ids=state.block_ids,
+        )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> SemBlendConnectorMetadata:
         loads: list[PendingLoad] = []
@@ -1558,11 +1755,17 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     load.token_count,
                 )
             layers_materialized = 0
+            donor_gone = False
             # The donor capture is indexed by absolute token position, so a
             # load whose destination starts past 0 has to read from the same
             # offset: donor_start and target_start are one frame, and the
             # exact-prefix path sets both to the local prefix-cache boundary.
             donor_start = load.donor_start or 0
+            storage_key = self._storage_key(load.donor_id, load.namespace)
+            entry = self._memory_store.get(storage_key)
+            if entry is not None:
+                # A load is a use: without it the cap evicts in arrival order.
+                self._memory_store.move_to_end(storage_key)
             for layer_name, dst_kv_cache_layer in self._iter_kv_layers(forward_context):
                 layer_metadata = self._layer_attn_metadata(attn_metadata, layer_name)
                 if layer_metadata is None:
@@ -1571,12 +1774,18 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     # layer). The MLA check below then answers "not MLA" by
                     # default, so keep the gap visible rather than silent.
                     self._stats["layer_attn_metadata_missing"] += 1
-                entry = self._memory_store.get(self._storage_key(load.donor_id, load.namespace))
                 if entry is not None and layer_name in entry:
                     src_kv_cache = entry[layer_name].to(dst_kv_cache_layer.device)
                 else:
                     filename = self._layer_filename(load.donor_id, load.namespace, layer_name)
-                    tensors = load_file(filename)
+                    try:
+                        tensors = load_file(filename)
+                    except OSError:
+                        # Evicted (or never fully captured) between the
+                        # scheduler's advertise and this load. Whole donors
+                        # go, not layers, so one miss decides the load.
+                        donor_gone = True
+                        break
                     src_kv_cache = tensors["kv_cache"].to(dst_kv_cache_layer.device)
                 if load.materialization_kind == MaterializationKind.SEMANTIC_SPAN:
                     src_kv_cache = self._semantic_span_slice(
@@ -1605,22 +1814,55 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     layer_metadata,
                 )
                 layers_materialized += 1
-            if (
-                layers_materialized <= 0
-                and load.materialization_kind == MaterializationKind.SEMANTIC_SPAN
+            if donor_gone:
+                self._stats["load_declined_donor_gone"] += 1
+                self._audit_event(
+                    "runtime_materialization_declined",
+                    request_id=load.request_id,
+                    donor_id=load.donor_id,
+                    namespace=load.namespace,
+                    tokens=int(load.token_count),
+                    materialization_kind=load.materialization_kind.value,
+                    declined_reason="donor_gone",
+                    layers_materialized=layers_materialized,
+                )
+            if load.materialization_kind == MaterializationKind.SEMANTIC_SPAN and (
+                donor_gone or layers_materialized <= 0
             ):
                 # The scheduler already skipped compute for these tokens;
-                # continuing without KV would decode garbage silently.
+                # continuing without KV would decode garbage silently. A
+                # donor that vanished after some layers were written is the
+                # same failure: those layers now disagree with the rest.
                 self._audit_event(
                     "runtime_materialization_failed_loud",
                     request_id=load.request_id,
                     donor_id=load.donor_id,
+                    reason="donor_gone" if donor_gone else "no_layers",
+                )
+                failure = (
+                    f"donor {load.donor_id} is gone from storage after "
+                    f"{layers_materialized} layer(s)"
+                    if donor_gone
+                    else "materialized 0 layers"
                 )
                 raise RuntimeError(
-                    "semantic-span load materialized 0 layers for "
-                    f"{load.request_id}; failing loudly instead of decoding "
-                    "over uninitialized KV"
+                    f"semantic-span load {failure} for {load.request_id}; "
+                    "failing loudly instead of decoding over uninitialized KV"
                 )
+            if donor_gone:
+                # The scheduler skipped compute for this window. Hand the
+                # blocks back so the engine recomputes them instead of
+                # decoding over whatever the pool held.
+                failed = self._destination_block_ids(load)
+                self._load_error_block_ids.update(failed)
+                self._stats["load_error_blocks_reported"] += len(failed)
+                self._audit_event(
+                    "load_error_blocks_reported",
+                    request_id=load.request_id,
+                    donor_id=load.donor_id,
+                    blocks=len(failed),
+                )
+                continue
             if layers_materialized <= 0:
                 self._stats["loads_rejected_no_kv_layers"] += 1
                 self._audit_event(
@@ -1659,39 +1901,126 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         if not isinstance(metadata, SemBlendConnectorMetadata) or not metadata.stores:
             return
 
-        from safetensors.torch import save_file
-
         for store in metadata.stores:
             if store.block_ids is None:
                 continue
-            slot_mapping = self._slot_mapping(store.block_ids, store.token_count, kv_layer.device)
-            actual_token_count = int(slot_mapping.numel())
-            kv_cache = self._extract_kv_from_layer(kv_layer, slot_mapping, attn_metadata)
-            donor_dir = self._donor_dir(store.request_id, store.namespace)
-            os.makedirs(donor_dir, exist_ok=True)
-            # The scheduler-role connector runs in another process and reads
-            # the captured length from this file for both backends.
-            with open(self._donor_metadata_path(store.request_id, store.namespace), "w", encoding="utf-8") as f:
-                json.dump({"token_count": actual_token_count}, f)
-            host_kv = kv_cache.detach().contiguous().cpu()
-            if self._config.kv_storage_backend == "memory":
-                key = self._storage_key(store.request_id, store.namespace)
-                entry = self._memory_store.get(key)
-                if entry is None:
-                    entry = {"__token_count__": actual_token_count}
-                    self._memory_store[key] = entry
-                    while len(self._memory_store) > max(1, self._config.kv_memory_max_donors):
-                        self._memory_store.popitem(last=False)
-                        self._stats["memory_store_evictions"] += 1
-                entry[layer_name] = host_kv
-                continue
-            save_file(
-                {"kv_cache": host_kv},
-                self._layer_filename(store.request_id, store.namespace, layer_name),
-            )
+            self._capture_layer(store, layer_name, kv_layer, attn_metadata)
+
+    def _capture_layer(
+        self, store: PendingStore, layer_name: str, kv_layer: Any, attn_metadata: Any
+    ) -> None:
+        """Copy one layer of the window this store adds, appended to earlier chunks.
+
+        ``store.token_count`` is the donor's computed end, not a chunk length:
+        the scheduler role does not know what the worker already holds, so the
+        window starts at this layer's own progress. The block table covers the
+        whole prefix from token 0, so when the earlier chunks are missing the
+        capture simply restarts from 0 rather than storing a tail alone.
+        """
+        import torch
+
+        progress = self._capture_progress.get(store.request_id, {})
+        start = progress.get(layer_name, 0)
+        if start >= store.token_count:
+            # A resumed request re-admitted as new re-announces an end this
+            # layer already reached.
+            self._stats["layer_capture_skipped_nothing_new"] += 1
+            return
+        base = self._captured_layer(store, layer_name) if start > 0 else None
+        if start > 0 and base is None:
+            self._stats["layer_capture_base_missing"] += 1
+            start = 0
+        slot_mapping = self._slot_mapping(
+            store.block_ids, store.token_count - start, kv_layer.device, target_start=start
+        )
+        kv_cache = self._extract_kv_from_layer(kv_layer, slot_mapping, attn_metadata)
+        host_kv = kv_cache.detach().contiguous().cpu()
+        if base is not None:
+            # MLA captures are [tokens, C]; every other layout [2, tokens, H*D].
+            host_kv = torch.cat((base, host_kv), dim=0 if host_kv.dim() == 2 else 1)
+        actual_token_count = start + int(slot_mapping.numel())
+        self._write_captured_layer(store, layer_name, host_kv, actual_token_count)
+        self._capture_progress[store.request_id] = {**progress, layer_name: actual_token_count}
+
+    def _captured_layer(self, store: PendingStore, layer_name: str) -> Any | None:
+        """This donor's stored copy of one layer, or None when there is none."""
+        if self._config.kv_storage_backend == "memory":
+            entry = self._memory_store.get(self._storage_key(store.request_id, store.namespace))
+            return None if entry is None else entry.get(layer_name)
+        from safetensors.torch import load_file
+
+        try:
+            tensors = load_file(self._layer_filename(store.request_id, store.namespace, layer_name))
+        except OSError:
+            return None
+        return tensors["kv_cache"]
+
+    def _write_captured_layer(
+        self, store: PendingStore, layer_name: str, host_kv: Any, token_count: int
+    ) -> None:
+        donor_dir = self._donor_dir(store.request_id, store.namespace)
+        os.makedirs(donor_dir, exist_ok=True)
+        # The scheduler-role connector runs in another process and reads
+        # the captured length from this file for both backends.
+        with open(self._donor_metadata_path(store.request_id, store.namespace), "w", encoding="utf-8") as f:
+            json.dump({"token_count": token_count}, f)
+        if self._config.kv_storage_backend == "memory":
+            key = self._storage_key(store.request_id, store.namespace)
+            entry = self._memory_store.get(key)
+            if entry is None:
+                entry = {"__token_count__": token_count, "__request_id__": store.request_id}
+                self._memory_store[key] = entry
+                while len(self._memory_store) > max(1, self._config.kv_memory_max_donors):
+                    self._evict_memory_donor()
+            else:
+                entry["__token_count__"] = token_count
+                self._memory_store.move_to_end(key)
+            entry[layer_name] = host_kv
+            return
+        from safetensors.torch import save_file
+
+        save_file(
+            {"kv_cache": host_kv},
+            self._layer_filename(store.request_id, store.namespace, layer_name),
+        )
+
+    def _evict_memory_donor(self) -> None:
+        """Drop the least recently used donor and retract its advertised length.
+
+        metadata.json is what the scheduler role sizes spans against, so left
+        behind it advertises tensors that no longer exist and the worker then
+        fails the load. The directory goes too: _has_stored_donor reads its
+        presence as "captured".
+        """
+        storage_key, entry = self._memory_store.popitem(last=False)
+        self._stats["memory_store_evictions"] += 1
+        self._capture_progress.pop(str(entry.get("__request_id__", "")), None)
+        donor_dir = self._donor_dir_for_key(storage_key)
+        try:
+            os.remove(os.path.join(donor_dir, _DONOR_METADATA_FILENAME))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self._stats["memory_store_eviction_retract_errors"] += 1
+            logger.warning("SemBlend evicted-donor metadata removal failed", exc_info=True)
+            return
+        try:
+            os.rmdir(donor_dir)
+        except OSError:
+            # Not empty or already gone; the length record is what mattered.
+            pass
 
     def wait_for_save(self) -> None:
         return
+
+    def get_finished(
+        self, finished_req_ids: set[str]
+    ) -> tuple[set[str] | None, set[str] | None]:
+        # Worker side. A finished request sends no more prefill chunks, so
+        # its capture progress can go; the captured donor itself stays.
+        for request_id in finished_req_ids or ():
+            self._capture_progress.pop(str(request_id), None)
+        return None, None
 
     def request_finished(
         self,
@@ -1701,6 +2030,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._lookup_cache.pop(self._request_id(request), None)
         self._load_plans.pop(self._request_id(request), None)
         self._seen_requests.discard(self._request_id(request))
+        self._capture_state.pop(self._request_id(request), None)
         if self._compat_decline is not None:
             # A donor captured under a layout this connector cannot address is
             # a landmine for every later recipient that plans against it.

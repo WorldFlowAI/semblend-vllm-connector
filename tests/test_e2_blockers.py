@@ -1,9 +1,8 @@
-"""E2 — one failing unit test per Phase-0 connector blocker (B1..B5).
+"""E2 — one regression test per Phase-0 connector blocker (B1..B5).
 
 Each test encodes the contract the fix must satisfy, not the numbers the
-current implementation happens to produce. B1/B2/B3 are in flight; B4/B5 are
-marked xfail(strict) so the suite stays green and flips loudly the moment
-those land.
+current implementation happens to produce. All five are live: a failure here
+is a blocker reopening, not a known gap.
 """
 
 from __future__ import annotations
@@ -41,7 +40,8 @@ def _connector(tmp_path, role, block_size=4, **extra):
     settings = {
         "mode": "semantic_span_experimental",
         "provider": "local",
-        "min_prompt_tokens": 4,
+        # At least min_semantic_span: the config warns about the gap otherwise.
+        "min_prompt_tokens": 8,
         "min_similarity": 0.3,
         "min_semantic_span": 8,
         "max_materialized_tokens": 4096,
@@ -267,7 +267,16 @@ def test_b3_failed_allocation_leaves_no_pending_load(tmp_path) -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="B4/B5 not yet implemented")
+def _save_memory_donor(connector, donor_id, kv_layer, token_count=4) -> None:
+    """One-layer capture of `donor_id` into a memory-backend worker."""
+    connector.bind_connector_metadata(
+        SemBlendConnectorMetadata(
+            stores=[_pending_store(request_id=donor_id, token_count=token_count, block_ids=([0],))]
+        )
+    )
+    connector.save_kv_layer("layer0", kv_layer, attn_metadata=object())
+
+
 def test_b4_eviction_clears_metadata_and_missing_donor_declines(tmp_path) -> None:
     """Evicting a donor must retract its advertised length, and a load
     against a donor whose tensors are gone must decline, not raise.
@@ -289,23 +298,23 @@ def test_b4_eviction_clears_metadata_and_missing_donor_declines(tmp_path) -> Non
     )
     kv_layer = torch.randn(2, 6, 4, 2, 8)
     for donor_id in ("d1", "d2"):
-        evicting.bind_connector_metadata(
-            SemBlendConnectorMetadata(
-                stores=[
-                    _pending_store(request_id=donor_id, token_count=4, block_ids=([0],)),
-                ]
-            )
-        )
-        evicting.save_kv_layer("layer0", kv_layer, attn_metadata=object())
+        _save_memory_donor(evicting, donor_id, kv_layer)
 
     assert evicting.stats_snapshot.get("memory_store_evictions", 0) == 1
     assert not os.path.exists(evicting._donor_metadata_path("d1", "ns"))  # noqa: SLF001
     assert evicting._stored_donor_token_count("d1", "ns") == 0  # noqa: SLF001
+    # Eviction took the right donor: the survivor is still fully advertised.
+    assert os.path.exists(evicting._donor_metadata_path("d2", "ns"))  # noqa: SLF001
+    assert evicting._stored_donor_token_count("d2", "ns") == 4  # noqa: SLF001
 
-    # A load whose donor is gone: the layer exists, so the load path reaches
-    # storage and must decline there instead of raising.
+    # A load whose donor is gone: the layers exist, so the load path reaches
+    # storage and must decline there instead of raising. Two layers, so the
+    # counter is checked as a per-load count (its name carries no unit
+    # suffix): a donor missing for one layer is missing for all of them, and
+    # a per-layer tally would read as two lost loads.
     loading = _connector(tmp_path / "gone", KVConnectorRole.WORKER)
-    loading.register_kv_caches({"layer0": torch.zeros(2, 6, 4, 2, 8)})
+    dst_layers = {"layer0": torch.zeros(2, 6, 4, 2, 8), "layer1": torch.zeros(2, 6, 4, 2, 8)}
+    loading.register_kv_caches(dst_layers)
     loading.bind_connector_metadata(
         SemBlendConnectorMetadata(
             loads=[
@@ -326,6 +335,79 @@ def test_b4_eviction_clears_metadata_and_missing_donor_declines(tmp_path) -> Non
     stats = loading.stats_snapshot
     assert stats.get("load_declined_donor_gone", 0) == 1
     assert stats.get("loads_materialized_total", 0) == 0
+    for layer_name, dst in dst_layers.items():
+        assert not dst.any(), f"declined load wrote into {layer_name}"
+
+
+def test_b4_semantic_span_load_against_missing_donor_fails_loud(tmp_path) -> None:
+    """For a semantic-span load the scheduler has already skipped compute on
+    the span, so a missing donor cannot be a quiet decline: the connector
+    counts it and then raises its own loud invariant (0 layers materialized)
+    rather than decoding over uninitialized KV — and rather than leaking a
+    FileNotFoundError out of storage, which is what happens today.
+    """
+    torch = pytest.importorskip("torch")
+
+    loading = _connector(tmp_path, KVConnectorRole.WORKER)
+    loading.register_kv_caches({"layer0": torch.zeros(2, 6, 4, 2, 8)})
+    loading.bind_connector_metadata(
+        SemBlendConnectorMetadata(
+            loads=[
+                PendingLoad(
+                    request_id="r1",
+                    donor_id="evicted",
+                    token_count=8,
+                    materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+                    namespace="ns",
+                    block_ids=([0, 1],),
+                    donor_start=0,
+                    target_start=0,
+                )
+            ]
+        )
+    )
+
+    # FileNotFoundError is an OSError, so it fails this clause rather than
+    # satisfying it.
+    with pytest.raises(RuntimeError):
+        loading.start_load_kv(FakeForwardContext(attn_metadata=object()))
+
+    stats = loading.stats_snapshot
+    assert stats.get("load_declined_donor_gone", 0) == 1
+    assert stats.get("loads_materialized_total", 0) == 0
+
+
+def test_b4_memory_backend_evicts_least_recently_used_donor(tmp_path) -> None:
+    """Eviction order must follow use, not arrival.
+
+    Today the memory backend evicts with `popitem(last=False)` and never
+    `move_to_end`s on a read, so a donor that is being served every step is
+    the first one dropped once the cap is reached — the hottest donor is the
+    one the store forgets. The length read is one of the two read paths;
+    touching d1 through it must move d1 behind d2 in the eviction order.
+    """
+    torch = pytest.importorskip("torch")
+
+    connector = _connector(
+        tmp_path,
+        KVConnectorRole.WORKER,
+        kv_storage_backend="memory",
+        kv_memory_max_donors=2,
+    )
+    kv_layer = torch.randn(2, 6, 4, 2, 8)
+    _save_memory_donor(connector, "d1", kv_layer)
+    _save_memory_donor(connector, "d2", kv_layer)
+
+    assert connector._stored_donor_token_count("d1", "ns") == 4  # noqa: SLF001
+
+    _save_memory_donor(connector, "d3", kv_layer)
+
+    assert connector.stats_snapshot.get("memory_store_evictions", 0) == 1
+    assert connector._stored_donor_token_count("d2", "ns") == 0, (  # noqa: SLF001
+        "arrival-order eviction kept the idle donor and dropped the one in use"
+    )
+    assert connector._stored_donor_token_count("d1", "ns") == 4  # noqa: SLF001
+    assert connector._stored_donor_token_count("d3", "ns") == 4  # noqa: SLF001
 
 
 # --------------------------------------------------------------------------
@@ -333,8 +415,22 @@ def test_b4_eviction_clears_metadata_and_missing_donor_declines(tmp_path) -> Non
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="B4/B5 not yet implemented")
-def test_b5_donor_capture_clamped_to_the_first_chunk(tmp_path) -> None:
+@pytest.mark.parametrize(
+    ("chunk_tokens", "expected_capture"),
+    [
+        pytest.param(2048, 2048, id="block-aligned-chunk"),
+        # The batched-token budget is shared across co-scheduled requests, so
+        # a chunk is not block-aligned in general; the capture floors to the
+        # last whole block the chunk computed.
+        pytest.param(2050, 2048, id="ragged-chunk-floors-to-block"),
+        # A chunk covering the whole prompt must not lift the existing cap
+        # that leaves the engine at least one token: 4000 -> 3984.
+        pytest.param(4000, 3984, id="whole-prompt-keeps-engine-token"),
+    ],
+)
+def test_b5_donor_capture_clamped_to_the_first_chunk(
+    tmp_path, chunk_tokens, expected_capture
+) -> None:
     """Under chunked prefill only the first chunk has been computed when the
     donor is captured, so the stored length must be that chunk, not the
     prompt.
@@ -351,18 +447,18 @@ def test_b5_donor_capture_clamped_to_the_first_chunk(tmp_path) -> None:
     scheduler = _connector(tmp_path, KVConnectorRole.SCHEDULER, block_size=block_size)
 
     prompt = list(range(4000))
-    chunk_tokens = 2048
     new_req = FakeRequest("d1", prompt)
     new_req.block_ids = ([*range(len(prompt) // block_size)],)
     scheduler_output = FakeSchedulerOutput(scheduled_new_reqs=[new_req])
+    # vLLM 0.29 SchedulerOutput.num_scheduled_tokens: dict[req_id, int].
     scheduler_output.num_scheduled_tokens = {"d1": chunk_tokens}
 
     metadata = scheduler.build_connector_meta(scheduler_output)
 
     assert len(metadata.stores) == 1
-    assert metadata.stores[0].token_count == chunk_tokens, (
-        "donor capture spans the whole prompt; tokens past the first chunk "
-        "were never computed"
+    assert metadata.stores[0].token_count == expected_capture, (
+        f"chunk of {chunk_tokens} scheduled tokens captured as "
+        f"{metadata.stores[0].token_count}; tokens past the chunk were never computed"
     )
 
     # The length the worker publishes is what recipients plan against.
@@ -377,4 +473,45 @@ def test_b5_donor_capture_clamped_to_the_first_chunk(tmp_path) -> None:
     stored = metadata.stores[0]
     with open(worker._donor_metadata_path("d1", stored.namespace), encoding="utf-8") as f:  # noqa: SLF001
         published = json.load(f)
-    assert published["token_count"] == chunk_tokens
+    assert published["token_count"] == expected_capture
+
+
+def test_gone_donor_on_non_span_load_reports_its_blocks_for_recompute(tmp_path) -> None:
+    """A declined load must hand its destination blocks back to the engine.
+
+    The scheduler already credited those tokens as computed, so a silent
+    decline leaves the request decoding over whatever the pool held. vLLM
+    drains `get_block_ids_with_load_errors` every forward and, under the
+    recompute failure policy the quickstart ships, recomputes exactly those
+    blocks. The span kind keeps its loud raise; this covers the other kinds.
+    """
+    torch = pytest.importorskip("torch")
+
+    loading = _connector(tmp_path / "gone", KVConnectorRole.WORKER)
+    loading.register_kv_caches({"layer0": torch.zeros(2, 12, 4, 2, 8)})
+    # target_start=4 with token_count=8 over block_size 4 covers list
+    # entries [1, 3): blocks 2 and 9. Block 7 is the untouched prefix.
+    loading.bind_connector_metadata(
+        SemBlendConnectorMetadata(
+            loads=[
+                PendingLoad(
+                    request_id="r1",
+                    donor_id="evicted",
+                    token_count=8,
+                    materialization_kind=MaterializationKind.REQUEST_ONLY,
+                    namespace="ns",
+                    block_ids=([7, 2, 9, 4],),
+                    target_start=4,
+                    donor_start=4,
+                )
+            ]
+        )
+    )
+
+    loading.start_load_kv(FakeForwardContext(attn_metadata=object()))
+
+    assert loading.stats_snapshot.get("load_declined_donor_gone", 0) == 1
+    assert loading.get_block_ids_with_load_errors() == {2, 9}
+    # Drained once reported, as the sync-loading contract requires.
+    assert loading.get_block_ids_with_load_errors() == set()
+    assert loading.stats_snapshot.get("load_error_blocks_reported", 0) == 2

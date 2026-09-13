@@ -41,7 +41,7 @@ cat > kvcfg.json << 'JSON'
   "kv_connector_extra_config": {
     "mode": "semantic_span_experimental",
     "provider": "semblend",
-    "min_prompt_tokens": 256,
+    "min_prompt_tokens": 512,
     "min_similarity": 0.7,
     "min_semantic_span": 512,
     "embedder_type": "minilm",
