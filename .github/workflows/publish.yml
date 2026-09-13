@@ -42,6 +42,13 @@ jobs:
     name: Publish distribution
     needs: build
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/semblend-vllm-connector
+    permissions:
+      id-token: write  # OIDC trusted publishing; no API token secret
+      attestations: write
+      contents: read
     steps:
       - name: Download distributions
         uses: actions/download-artifact@v4
@@ -49,8 +56,13 @@ jobs:
           name: dist
           path: dist/
 
+      - name: Generate build attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*
+
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          user: __token__
-          password: ${{ secrets.PYPI_API_TOKEN }}
+        # Trusted publishing. One-time setup on PyPI:
+        # https://pypi.org/manage/project/semblend-vllm-connector/settings/publishing/
+        # (owner WorldFlowAI, repo semblend-vllm-connector, workflow publish.yml, environment pypi)
