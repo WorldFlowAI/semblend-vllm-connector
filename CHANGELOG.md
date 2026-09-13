@@ -5,6 +5,47 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
+## 0.2.2 - 2026-09-13
+
+Correctness release for the semantic-span path on stock vLLM 0.29. Every
+item below was found by reading the engine source or by tests that fail
+against 0.2.1; no behavior was measured on a GPU in this release.
+
+- Span loads at a non-zero boundary wrote donor KV over the request's
+  shared prefix blocks and left the credited window uninitialized. The
+  write now lands at the target offset on both the semantic-span and the
+  exact-prefix paths, and the donor offset travels with it.
+- Three guards never fired: the compressed-attention check tested a type
+  the engine never passes, the rope check skipped its own bail-out on
+  scaled-rope models, and nothing refused backends that pack attention
+  heads differently. Each wrote silently wrong KV; each now declines.
+- An advertised span that reached the prompt end drove the engine's
+  remaining work to zero and tripped an engine assertion. Advertised
+  counts are now capped so at least one token is always left to compute.
+- The pending load is built once allocation has succeeded, not inside the
+  match hook the engine documents as side-effect free.
+- Counters are per request unless their name says per attempt; a request
+  re-queued under memory pressure was inflating every reported rate.
+- Donor storage: eviction retracts the donor's advertised length and its
+  files, both read paths count as a use, and a donor missing at load time
+  is a counted decline. Non-span kinds hand their blocks back through the
+  engine's load-error hook so vLLM recomputes them under the recompute
+  failure policy; the span kind still fails loudly.
+- Donor capture is clamped to what the engine actually scheduled and
+  continues across later prefill chunks, so a donor's recorded length is
+  what was written rather than the whole prompt.
+- `min_prompt_tokens` defaults to 512 to match `min_semantic_span`, with a
+  warning when they disagree in span mode. `min_boundary_tokens` is added
+  for a later release.
+- A compatibility suite that drives all four connector hooks against real
+  tensors, and loads vLLM's own type module when a source tree is
+  available (`SEMBLEND_VLLM_SOURCE`), skipping loudly otherwise.
+- Publishing moves to PyPI trusted publishing; no API token secret.
+
+Known: the semantic-span mode still requires prefix caching off, which
+limits it to spans that begin at the prompt start. Lifting that is the
+next release.
+
 ## 0.2.1 - 2026-09-03
 
 - Recipients that received a semantic load are no longer captured as
