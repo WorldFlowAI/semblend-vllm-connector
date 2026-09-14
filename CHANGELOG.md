@@ -8,15 +8,36 @@ between minor releases while the vLLM semantic KV interface is experimental.
 ## Unreleased
 
 - Blocks the connector fills are evicted from vLLM's exact prefix cache on
-  the step they are filled and on every later step the request runs, so
-  approximate KV can no longer be served to a later request through the
-  engine's own exact match. Evictions are counted and audited per load.
+  the step they are filled, and the same pass runs again on every later step
+  the request is scheduled, so the blocks vLLM hashes as the request
+  continues -- the rest of the prompt under chunked prefill, then every
+  decode block -- go the same way. Approximate KV can no longer be served to
+  a later request through the engine's own exact match. Evictions are
+  counted and audited per load.
   This is what allows the semantic-span mode to run with prefix caching
   enabled; the quickstart still says to disable it until the change has
   been measured on a GPU.
 - `min_boundary_tokens` is enforced ahead of the provider lookup, in every
   mode: set it to the block size so unserved requests prime the shared
   prefix cleanly.
+- `evict_filled_blocks_from_prefix_cache` (default `true`) turns that
+  eviction off for a contaminated control run. With it off nothing is
+  evicted -- approximate KV stays servable to a later exact match -- but the
+  connector still tracks the blocks it filled and writes a
+  `prefix_cache_blocks_left_cached` audit event whenever a pass finds
+  filled blocks cached, with the count and the request's join key, so what
+  the eviction removes can be measured rather than asserted. Measurement
+  only; the default behaviour is unchanged.
+- Both prefix-cache audit events also carry a distinct-block count and a
+  request-scoped distinct total (`prefix_cache_distinct_blocks_evicted` /
+  `prefix_cache_distinct_blocks_left_cached`), and that is the pair to
+  compare across arms: it counts distinct physical blocks per request and
+  survives a readmission, including one the scheduler drops before the span
+  is served. The per-pass counts beside them are not comparable. Both arms
+  report a block once while the request keeps the same block table; a
+  preemption replaces that table, and the blocks are then re-found on the
+  contaminated arm whether or not the engine re-hashed them, while the
+  eviction arm meets again only the ones it did. See the audit contract.
 
 ## 0.2.2 - 2026-09-13
 

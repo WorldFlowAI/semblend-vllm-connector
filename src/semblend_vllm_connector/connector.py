@@ -83,25 +83,38 @@ class _FilledBlocks:
     that allocated them, so a later request can match approximate KV through
     the engine's own lookup -- which runs before this connector is consulted,
     with no gate, no TTL, no tenant check and no decision to record. They are
-    therefore evicted from that hash table on the step they are filled and
-    again on every later step the request runs, because a poisoned block's
-    hash is the parent of every block hashed after it: the contaminated set is
-    the fill plus the whole rest of the request, decode included.
+    therefore evicted from that hash table on the step they are filled, and the
+    same pass runs again on every later step the request is scheduled: a
+    poisoned block's hash is the parent of every block hashed after it, so the
+    contaminated set is the fill plus the whole rest of the request, decode
+    included, and each of those blocks is met on the step vLLM hashes it. They
+    are tracked the same way when ``evict_filled_blocks_from_prefix_cache`` is
+    off -- the pass then reports what it would have evicted rather than
+    evicting it.
 
     ``first_approx_block`` is the block index where the fill starts; blocks
     before it are genuine local prefix-cache hits and must keep their entries.
-    ``evicted`` is what has actually been removed, so no block is handed to
-    ``evict_blocks`` twice.
+    ``settled`` is what this connector has already acted on for the block table
+    it currently holds, so no block is handed to ``evict_blocks`` twice. It is
+    deliberately cleared whenever the table is replaced, because a replaced
+    table is a fresh claim about which blocks the request holds -- and even
+    when the ids are the same ones, they were re-hashed on the way back in and
+    have to be acted on again.
+
+    The set of distinct physical blocks the request has been counted for is
+    deliberately *not* held here: this whole state is dropped whenever the
+    block table it describes becomes a stale claim, and that count has to
+    outlive every such drop. It lives in ``_reported_fill_blocks`` instead.
     """
 
     block_ids: tuple[list[int], ...]
     first_approx_block: int
     donor_id: str
     namespace: str
-    evicted: frozenset[int]
-    # Everything before this index is already evicted, so a later pass scans
+    settled: frozenset[int]
+    # Everything before this index is already settled, so a later pass scans
     # only the tail. It never skips an uncached block: it advances only past
-    # a contiguous run that was actually removed.
+    # a contiguous run that was actually acted on.
     scan_from: int = 0
 
 
@@ -276,8 +289,17 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # The scheduler's GPU block pool, bound below; the only handle a
         # connector gets on the exact prefix cache its fills are inserted into.
         self._gpu_block_pool: Any = None
-        # Requests whose filled blocks are being kept out of that cache.
+        # Requests whose filled blocks are being kept out of that cache, or,
+        # with the eviction knob off, tracked so the audit can say which
+        # blocks were left in it.
         self._filled_blocks: dict[str, _FilledBlocks] = {}
+        # Distinct physical blocks each request has already been counted for,
+        # on either path. Kept apart from _filled_blocks because that state is
+        # dropped on every readmission -- served or not -- while this ledger is
+        # what makes the distinct totals per request rather than per admission,
+        # and therefore comparable between the two arms. Retired with the
+        # request, in request_finished and on this step's finished ids.
+        self._reported_fill_blocks: dict[str, frozenset[int]] = {}
         self._last_attn_metadata: Any = None
         # vllm-fork capability gate: re-consult this connector at chunked
         # continuation boundaries (mid-prompt external KV). Only the
@@ -325,6 +347,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             logger.error(
                 "SemBlendVllmConnector declining all reuse: %s", self._compat_decline
             )
+        if not self._config.evict_filled_blocks_from_prefix_cache:
+            logger.warning(
+                "SemBlendVllmConnector is leaving the blocks it fills in vLLM's "
+                "exact prefix cache (evict_filled_blocks_from_prefix_cache=false): "
+                "approximate donor KV can be served to a later exact match, with "
+                "no gate and no decision recorded. Measurement only."
+            )
         if self._config.log_decisions:
             logger.info(
                 "SemBlendVllmConnector initialized role=%s mode=%s provider=%s "
@@ -341,6 +370,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             provider=self._config.provider,
             block_size=self._block_size,
             hybrid_kv_cache_manager_disabled=hma_disabled,
+            evict_filled_blocks_from_prefix_cache=(
+                self._config.evict_filled_blocks_from_prefix_cache
+            ),
             compat_declined_reason=self._compat_decline,
             compat_check_incomplete=",".join(self._compat_check_incomplete) or None,
         )
@@ -1714,6 +1746,125 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             return True
         return block_id in (getattr(pool, "cached_block_hashes_by_block", None) or ())
 
+    def _cached_fill_blocks(self, pool: Any, state: _FilledBlocks) -> set[int]:
+        """Filled blocks the pool's hash table names and this pass has not settled.
+
+        ``_maybe_evict_cached_block`` reports a block to the pool's metrics
+        collector *before* it checks for a hash, so eviction is not idempotent:
+        a second pass over an id, the shared null placeholder, or an id that is
+        not cached yet would destroy that block's residency tracking for
+        nothing. An uncached block is revisited on a later step instead, once
+        vLLM has actually hashed it.
+        """
+        null_block_id = getattr(getattr(pool, "null_block", None), "block_id", None)
+        start = max(state.first_approx_block, state.scan_from)
+        return {
+            block_id
+            for group in state.block_ids
+            for block_id in group[start:]
+            if block_id != null_block_id
+            and block_id not in state.settled
+            and self._block_is_cached(pool, block_id)
+        }
+
+    @staticmethod
+    def _settle(state: _FilledBlocks, handled: set[int]) -> _FilledBlocks:
+        """Fold the blocks this pass acted on into the request's tracked state."""
+        settled = state.settled | frozenset(handled)
+        head = state.block_ids[0] if state.block_ids else []
+        cursor = max(state.first_approx_block, state.scan_from)
+        while cursor < len(head) and head[cursor] in settled:
+            cursor += 1
+        return replace(state, settled=settled, scan_from=cursor)
+
+    def _reported_blocks(self, request_id: str) -> frozenset[int]:
+        """Distinct physical blocks this request has already been counted for."""
+        return self._reported_fill_blocks.get(request_id, frozenset())
+
+    def _settle_and_count(
+        self, request_id: str, state: _FilledBlocks, handled: set[int]
+    ) -> _FilledBlocks:
+        """Settle this pass and add its blocks to the request's distinct ledger."""
+        self._reported_fill_blocks[request_id] = self._reported_blocks(request_id) | frozenset(
+            handled
+        )
+        return self._settle(state, handled)
+
+    def _track_filled_blocks(
+        self, request_id: str, state: _FilledBlocks, *, phase: str
+    ) -> _FilledBlocks:
+        """Act on the blocks this fill put into vLLM's exact prefix cache.
+
+        Eviction is the shipped behaviour. With
+        ``evict_filled_blocks_from_prefix_cache`` off the same blocks are
+        tracked and audited but left cached, which is the contaminated control
+        a measurement of the eviction's effect needs.
+        """
+        if self._config.evict_filled_blocks_from_prefix_cache:
+            return self._evict_filled_blocks(request_id, state, phase=phase)
+        return self._note_filled_blocks_left_cached(request_id, state, phase=phase)
+
+    def _note_filled_blocks_left_cached(
+        self, request_id: str, state: _FilledBlocks, *, phase: str
+    ) -> _FilledBlocks:
+        """Record the filled blocks this pass deliberately left exact-matchable.
+
+        Measurement only: nothing is evicted, so donor KV stays readable by any
+        later request whose token ids hash onto these blocks. The blocks are
+        tracked exactly as the eviction path tracks them, so the audit says
+        what would have gone, and the pass is reported in both units: what it
+        found cached, and how much of that this request had not been counted
+        for yet. Only the second is comparable with the eviction arm.
+        """
+        pool = self._gpu_block_pool
+        if pool is None:
+            # Which filled blocks are cached is the pool's answer to give, so
+            # without it there is nothing to name. Counts passes, like the
+            # eviction-side counter beside it.
+            if not self._stats["prefix_cache_left_cached_passes_without_pool"]:
+                logger.warning(
+                    "SemBlend cannot report the blocks it left in the prefix cache: "
+                    "no GPU block pool was bound"
+                )
+            self._stats["prefix_cache_left_cached_passes_without_pool"] += 1
+            return state
+        scanned = self._cached_fill_blocks(pool, state)
+        if not scanned:
+            return state
+        # A replaced block table re-offers blocks an earlier pass already
+        # counted. The pass is still reported -- silence would read as the
+        # request having stopped being contaminated -- but those blocks add
+        # nothing to the distinct total.
+        reported = self._reported_blocks(request_id)
+        first_seen = scanned - reported
+        self._stats["prefix_cache_blocks_left_cached"] += len(scanned)
+        self._stats["prefix_cache_distinct_blocks_left_cached"] += len(first_seen)
+        self._audit_event(
+            "prefix_cache_blocks_left_cached",
+            request_id=request_id,
+            donor_id=state.donor_id,
+            namespace=state.namespace,
+            phase=phase,
+            blocks_left_cached=len(scanned),
+            blocks_left_cached_cumulative=len(state.settled) + len(scanned),
+            distinct_blocks_left_cached=len(first_seen),
+            distinct_blocks_left_cached_cumulative=len(reported | scanned),
+            block_ids_left_cached=sorted(scanned),
+            first_approx_block=int(state.first_approx_block),
+            block_table_blocks=sum(len(group) for group in state.block_ids),
+        )
+        if self._config.log_decisions and phase == "load_allocated":
+            logger.warning(
+                "SemBlend left filled blocks in the prefix cache request_id=%s "
+                "donor_id=%s first_approx_block=%d blocks=%d "
+                "(evict_filled_blocks_from_prefix_cache is off)",
+                request_id,
+                state.donor_id,
+                state.first_approx_block,
+                len(scanned),
+            )
+        return self._settle_and_count(request_id, state, scanned)
+
     def _evict_filled_blocks(
         self, request_id: str, state: _FilledBlocks, *, phase: str
     ) -> _FilledBlocks:
@@ -1748,22 +1899,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             f"prefix hash block size {hash_block_size} != connector block_size "
             f"{self._block_size}: evicted blocks would be re-registered every step"
         )
-        null_block_id = getattr(getattr(pool, "null_block", None), "block_id", None)
-        start = max(state.first_approx_block, state.scan_from)
-        to_evict = {
-            block_id
-            for group in state.block_ids
-            for block_id in group[start:]
-            # _maybe_evict_cached_block reports the block to the pool's metrics
-            # collector *before* it checks for a hash, so eviction is not
-            # idempotent: a second pass over an id, the shared null placeholder,
-            # or an id that is not cached yet would destroy that block's
-            # residency tracking for nothing. An uncached block is revisited on
-            # a later step instead, once vLLM has actually hashed it.
-            if block_id != null_block_id
-            and block_id not in state.evicted
-            and self._block_is_cached(pool, block_id)
-        }
+        to_evict = self._cached_fill_blocks(pool, state)
         if not to_evict:
             return state
         try:
@@ -1775,7 +1911,14 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 logger.exception("SemBlend prefix-cache eviction failed")
             self._stats["prefix_cache_eviction_error_passes"] += 1
             return state
+        # A readmitted request can be handed its own just-freed blocks back,
+        # re-hashed: those have to be evicted again, and the eviction counts
+        # say so, but they are not new contaminated blocks. The distinct total
+        # is what the contaminated control arm can be compared against.
+        reported = self._reported_blocks(request_id)
+        first_seen = to_evict - reported
         self._stats["prefix_cache_blocks_evicted"] += len(to_evict)
+        self._stats["prefix_cache_distinct_blocks_evicted"] += len(first_seen)
         self._audit_event(
             "prefix_cache_blocks_evicted",
             request_id=request_id,
@@ -1783,7 +1926,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             namespace=state.namespace,
             phase=phase,
             blocks_evicted=len(to_evict),
-            blocks_evicted_cumulative=len(state.evicted) + len(to_evict),
+            blocks_evicted_cumulative=len(state.settled) + len(to_evict),
+            distinct_blocks_evicted=len(first_seen),
+            distinct_blocks_evicted_cumulative=len(reported | to_evict),
             first_approx_block=int(state.first_approx_block),
             block_table_blocks=sum(len(group) for group in state.block_ids),
         )
@@ -1799,12 +1944,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 state.first_approx_block,
                 len(to_evict),
             )
-        evicted = state.evicted | frozenset(to_evict)
-        head = state.block_ids[0] if state.block_ids else []
-        cursor = start
-        while cursor < len(head) and head[cursor] in evicted:
-            cursor += 1
-        return replace(state, evicted=evicted, scan_from=cursor)
+        return self._settle_and_count(request_id, state, to_evict)
 
     def update_state_after_alloc(
         self,
@@ -1813,12 +1953,17 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         num_external_tokens: int,
     ) -> None:
         request_id = self._request_id(request)
-        # Readmission after preemption re-hashes the whole prefix onto new
-        # physical blocks (num_computed_tokens is reset to 0, so the connector
-        # is re-queried from boundary 0), which makes anything tracked from the
-        # previous admission name blocks this request no longer owns. Drop it
-        # before deciding again and re-derive below: evicting on a stale table
-        # would knock unrelated traffic out of the prefix cache.
+        # Readmission after preemption re-hashes the whole prefix (the freed
+        # blocks may or may not be the ones handed back; num_computed_tokens is
+        # reset to 0, so the connector is re-queried from boundary 0), which
+        # makes anything tracked from the previous admission a claim about a
+        # block table this request may no longer own. Drop it before deciding
+        # again and re-derive below: evicting on a stale table would knock
+        # unrelated traffic out of the prefix cache. The distinct-block ledger
+        # is not part of that state and is left alone here, so it crosses the
+        # gap whether or not this readmission goes on to be served -- every
+        # exit below is a request that keeps the blocks it was already counted
+        # for.
         self._filled_blocks.pop(request_id, None)
         # The scheduler dropped the advertised span (e.g. a partial-tail loss):
         # the plan is stale and must not become a load.
@@ -1899,9 +2044,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             first_approx_block=int(plan["target_start"] or 0) // self._block_size,
             donor_id=str(plan["donor_id"]),
             namespace=str(plan["namespace"]),
-            evicted=frozenset(),
+            settled=frozenset(),
         )
-        self._filled_blocks[request_id] = self._evict_filled_blocks(
+        self._filled_blocks[request_id] = self._track_filled_blocks(
             request_id, state, phase="load_allocated"
         )
 
@@ -2169,12 +2314,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 continue
             loads.append(load)
         stores = self._build_store_metadata(scheduler_output)
-        self._evict_running_fills(scheduler_output)
+        self._track_running_fills(scheduler_output)
         self._pending_loads.clear()
         return SemBlendConnectorMetadata(loads=loads, stores=stores)
 
-    def _evict_running_fills(self, scheduler_output: "SchedulerOutput") -> None:
-        """Keep evicting as a served request fills more blocks.
+    def _track_running_fills(self, scheduler_output: "SchedulerOutput") -> None:
+        """Keep acting on a served request's blocks as it fills more of them.
 
         A poisoned block's hash is the parent of every block hashed after it,
         so the contaminated set grows with the request: the rest of the prompt
@@ -2187,10 +2332,14 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         someone else; it re-derives through update_state_after_alloc when it is
         readmitted.
         """
-        if not self._filled_blocks:
-            return
+        # Retired first, and not behind the tracked-requests check below: a
+        # request can outlive its own block-table state (a readmission that was
+        # not served drops it) and its distinct-block ledger has to go with it.
         for finished_id in getattr(scheduler_output, "finished_req_ids", None) or ():
             self._filled_blocks.pop(str(finished_id), None)
+            self._reported_fill_blocks.pop(str(finished_id), None)
+        if not self._filled_blocks:
+            return
         cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
         if cached is None or not self._filled_blocks:
             return
@@ -2215,12 +2364,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             next_state = replace(
                 state,
                 block_ids=block_ids,
-                # A replaced table names different physical blocks, so what was
-                # evicted from the old one says nothing about these.
-                evicted=frozenset() if replace_table else state.evicted,
+                # A replaced table is a fresh claim about which blocks this
+                # request holds, so what was settled on the old one says
+                # nothing about these. The distinct-block ledger is kept
+                # elsewhere and is untouched by the replacement, so a block
+                # counted once is not counted again.
+                settled=frozenset() if replace_table else state.settled,
                 scan_from=0 if replace_table else state.scan_from,
             )
-            self._filled_blocks[request_id] = self._evict_filled_blocks(
+            self._filled_blocks[request_id] = self._track_filled_blocks(
                 request_id, next_state, phase="running_step"
             )
 
@@ -2774,6 +2926,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # last step that cached any of them was evicted from build_connector_meta
         # while the request was still running.
         self._filled_blocks.pop(request_id, None)
+        self._reported_fill_blocks.pop(request_id, None)
         try:
             self._register_donor_on_finish(request, request_id, block_ids)
         finally:

@@ -140,6 +140,7 @@ def test_getter_path_carries_every_config_field() -> None:
         "kv_storage_backend": "MEMORY",
         "kv_memory_max_donors": 3,
         "min_boundary_tokens": 16,
+        "evict_filled_blocks_from_prefix_cache": "false",
     }
     # A field added to the config without a line here is exactly the drift
     # this test exists to catch.
@@ -171,6 +172,7 @@ def test_getter_path_carries_every_config_field() -> None:
     assert cfg.kv_storage_backend == "memory"
     assert cfg.kv_memory_max_donors == 3
     assert cfg.min_boundary_tokens == 16
+    assert cfg.evict_filled_blocks_from_prefix_cache is False
 
 
 def test_env_path_defaults_match_dataclass_defaults() -> None:
@@ -258,3 +260,43 @@ def test_min_boundary_tokens_unparseable_falls_back_to_default(monkeypatch) -> N
     monkeypatch.setenv("SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", "one-block")
     cfg = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
     assert cfg.min_boundary_tokens == 0
+
+
+def test_prefix_cache_eviction_defaults_on() -> None:
+    """The safe behaviour is the default: an operator who never heard of the
+    knob gets the contamination mitigation."""
+    cfg = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
+    assert cfg.evict_filled_blocks_from_prefix_cache is True
+
+
+def test_prefix_cache_eviction_parses_bool_and_string_forms() -> None:
+    for raw in (False, "false", "off", "no", "0"):
+        cfg = SemBlendVllmConfig.from_vllm_config(
+            FakeVllmConfig(FakeKvTransferConfig({"evict_filled_blocks_from_prefix_cache": raw}))
+        )
+        assert cfg.evict_filled_blocks_from_prefix_cache is False, raw
+    for raw in (True, "true", "on", "yes", "1"):
+        cfg = SemBlendVllmConfig.from_vllm_config(
+            FakeVllmConfig(FakeKvTransferConfig({"evict_filled_blocks_from_prefix_cache": raw}))
+        )
+        assert cfg.evict_filled_blocks_from_prefix_cache is True, raw
+
+
+def test_prefix_cache_eviction_reads_env_and_extra_config_wins(monkeypatch) -> None:
+    monkeypatch.setenv("SEMBLEND_VLLM_EVICT_FILLED_BLOCKS_FROM_PREFIX_CACHE", "false")
+    from_env = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
+    assert from_env.evict_filled_blocks_from_prefix_cache is False
+
+    explicit = SemBlendVllmConfig.from_vllm_config(
+        FakeVllmConfig(FakeKvTransferConfig({"evict_filled_blocks_from_prefix_cache": True}))
+    )
+    assert explicit.evict_filled_blocks_from_prefix_cache is True
+
+
+def test_prefix_cache_eviction_unparseable_falls_back_to_the_safe_default(
+    monkeypatch,
+) -> None:
+    """A typo must not silently leave approximate KV exact-matchable."""
+    monkeypatch.setenv("SEMBLEND_VLLM_EVICT_FILLED_BLOCKS_FROM_PREFIX_CACHE", "nope")
+    cfg = SemBlendVllmConfig.from_vllm_config(FakeVllmConfig(FakeKvTransferConfig()))
+    assert cfg.evict_filled_blocks_from_prefix_cache is True

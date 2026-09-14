@@ -104,6 +104,17 @@ class SemBlendVllmConfig:
     # the match hook, ahead of the provider lookup, so a declined request
     # costs no embedding; it applies in every mode.
     min_boundary_tokens: int = 0
+    # Whether blocks this connector fills are dropped from vLLM's exact
+    # prefix cache. They hold donor KV hashed under the recipient's own token
+    # ids, and vLLM caches them in the same allocate_slots call that allocated
+    # them, so with this off a later request whose tokens hash the same way is
+    # served approximate KV through the engine's exact match -- upstream of
+    # this connector, so no gate, no TTL and no decision is recorded. Leave it
+    # on. Turning it off is for measurement only: it is what makes a
+    # contaminated control arm, so the eviction's effect can be quantified.
+    # With it off the connector still tracks the blocks it filled and audits
+    # what it would have evicted.
+    evict_filled_blocks_from_prefix_cache: bool = True
     min_similarity: float = 0.70
     min_reuse_ratio: float = 0.50
     embedder_type: str | None = None
@@ -185,6 +196,12 @@ class SemBlendVllmConfig:
             min_semantic_span=_read_int(extra, "min_semantic_span", "SEMBLEND_VLLM_MIN_SEMANTIC_SPAN", 512),
             min_boundary_tokens=_read_int(
                 extra, "min_boundary_tokens", "SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", 0
+            ),
+            evict_filled_blocks_from_prefix_cache=_read_bool(
+                extra,
+                "evict_filled_blocks_from_prefix_cache",
+                "SEMBLEND_VLLM_EVICT_FILLED_BLOCKS_FROM_PREFIX_CACHE",
+                True,
             ),
             min_similarity=_read_float(extra, "min_similarity", "SEMBLEND_VLLM_MIN_SIMILARITY", 0.70),
             min_reuse_ratio=_read_float(

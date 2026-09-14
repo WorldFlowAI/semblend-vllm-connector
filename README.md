@@ -147,6 +147,16 @@ The connector must not:
 - cross model, tokenizer, adapter, or cache-salt namespaces;
 - fail inference because semantic lookup failed.
 
+The blocks a semantic load fills are therefore evicted from vLLM's exact prefix
+cache. `evict_filled_blocks_from_prefix_cache: false` switches that off and is
+the one supported way to break the third rule above: it exists so a measurement
+can quantify what the eviction removes, and it lets approximate KV be served to
+a later exact match. Leave it at its default (`true`) anywhere else. Compare
+the two runs on `prefix_cache_distinct_blocks_evicted` against
+`prefix_cache_distinct_blocks_left_cached`; the per-pass counts beside them are
+not comparable across the arms
+([audit contract](docs/VLLM_CONNECTOR_CONTRACT.md#audit-contract)).
+
 ## Repository Layout
 
 ```text

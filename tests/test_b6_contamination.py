@@ -16,9 +16,11 @@ touching its ref count. These tests pin what makes that safe:
 
 * only the connector-filled tail goes -- blocks below the boundary hold the
   recipient's own computed prefix and are vLLM's to cache;
-* each block reaches ``evict_blocks`` at most once, because
+* each block reaches ``evict_blocks`` at most once per admission, because
   ``_maybe_evict_cached_block`` reports a block to the pool's metrics
-  collector before it checks whether the block has a hash at all;
+  collector before it checks whether the block has a hash at all (a readmitted
+  request's blocks are re-hashed and do go again -- see
+  tests/test_b6_arm_comparability.py, which pins what that means for the A/B);
 * a resumed request's block table is replaced, not appended to;
 * the null block is never passed in;
 * ``min_boundary_tokens`` keeps boundary-0 serves from starving the shared
@@ -473,8 +475,10 @@ def test_first_connector_filled_block_is_re_derived_after_preemption(tmp_path) -
     assert pool.evicted_since() == set(range(103, 200))
 
     # _preempt_request resets num_computed_tokens to 0 and drops
-    # num_cached_block, so the prefix is re-hashed onto new physical blocks and
-    # the connector is re-queried -- at a different boundary. Holding on to the
+    # num_cached_block, so the prefix is re-hashed -- here onto a different set
+    # of physical blocks -- and the connector is re-queried at a different
+    # boundary (it can also come back onto the same ids: see
+    # tests/test_b6_arm_comparability.py). Holding on to the
     # first answer (block index 3) would evict from the middle of a prefix vLLM
     # has every right to keep: 300-309 are computed, not connector-filled.
     second_table = (list(range(300, 400)),)
