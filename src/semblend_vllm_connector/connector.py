@@ -290,6 +290,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # Scheduler-side state for donors still in prefill, so the chunks
         # after admission can be captured too.
         self._capture_state: dict[str, _CaptureState] = {}
+        # Request id -> the reason its capture was skipped, read at finish by
+        # the donor registration. A request with no captured KV cannot supply
+        # anything to anyone, so registering it can only take a candidate slot
+        # from a donor that can. Retired with the request.
+        self._capture_skipped_reasons: dict[str, str] = {}
         # The scheduler's GPU block pool, bound below; the only handle a
         # connector gets on the exact prefix cache its fills are inserted into.
         self._gpu_block_pool: Any = None
@@ -1199,6 +1204,50 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 )
             return 0, False
 
+        remaining = max(0, len(token_ids) - int(num_computed_tokens))
+        if (
+            self._config.mode == ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL
+            and remaining < self._config.min_semantic_span
+        ):
+            # vLLM's own prefix cache has already computed all but `remaining`
+            # tokens, and a span shorter than the operator's floor is declined
+            # further down whatever it matched (block_align_spans, then the
+            # post-clamp floor). So the lookup below cannot end in a load no
+            # matter what it finds, and running it buys an embedding plus a
+            # provider round trip for a decision already made. Measured on a
+            # verbatim re-issue: 3408 of 3411 tokens already computed, a ~26 ms
+            # lookup per repeat, every one of them ending in
+            # semantic_span_boundary_missed.
+            #
+            # Attempt-scoped, like the two gates above: the boundary moves
+            # between attempts, so a request declined here can still be
+            # served at an earlier one.
+            #
+            # Semantic-span mode only. min_semantic_span gates block_align_spans
+            # and nothing else, so in the other modes there is no floor for a
+            # short tail to fall under and the gate would decline work that
+            # could still be served.
+            self._stats["skipped_remaining_below_min_span_per_attempt"] += 1
+            self._audit_event(
+                "lookup_skipped_remaining_below_min_span",
+                request_id=request_id,
+                attempt=attempt,
+                boundary=int(num_computed_tokens),
+                block_size=self._block_size,
+                prompt_tokens=len(token_ids),
+                remaining=int(remaining),
+                min_semantic_span=int(self._config.min_semantic_span),
+            )
+            if self._config.log_decisions:
+                logger.info(
+                    "SemBlend lookup skipped request_id=%s reason=remaining_below_min_span "
+                    "remaining=%d min_semantic_span=%d",
+                    request_id,
+                    remaining,
+                    self._config.min_semantic_span,
+                )
+            return 0, False
+
         if self._provider is None:
             if first_attempt:
                 self._stats["skipped_no_provider"] += 1
@@ -2052,7 +2101,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
         M2's supply side is the donor pool: a request skipped here is a donor
         no later recipient could match, and the reasons need different fixes.
+
+        The reason is also kept until the request finishes, because it decides
+        whether the request may be registered as a donor at all: a skipped
+        capture leaves no KV behind, and a donor with no KV is a candidate
+        that can never be served from.
         """
+        self._capture_skipped_reasons[request_id] = reason
         self._stats[f"capture_skipped_{reason}"] += 1
         self._audit_event("capture_skipped", request_id=request_id, reason=reason, **fields)
 
@@ -2062,6 +2117,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             return []
         for finished_id in getattr(scheduler_output, "finished_req_ids", None) or ():
             self._capture_state.pop(str(finished_id), None)
+            # request_finished has already read and retired this; the pop is
+            # here so an engine that never calls it leaks nothing.
+            self._capture_skipped_reasons.pop(str(finished_id), None)
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
         return [
             *self._capture_admitted(scheduler_output, scheduled_tokens),
@@ -2268,6 +2326,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             self._capture_state.pop(request_id, None)
         else:
             self._capture_state[request_id] = replace(state, captured_end=end)
+        # This request now has KV of its own on the way, so an earlier skip is
+        # no longer what its capture ended on and must not block its
+        # registration. A skip recorded *after* this one still does: a
+        # recipient handed donor KV mid-prompt is exactly what the
+        # served_request skip exists for.
+        self._capture_skipped_reasons.pop(request_id, None)
         return PendingStore(
             request_id=request_id,
             token_ids=state.token_ids,
@@ -2863,6 +2927,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         for request_id in finished_req_ids or ():
             self._capture_progress.pop(str(request_id), None)
             self._capture_base_missing_noted.pop(str(request_id), None)
+            self._capture_skipped_reasons.pop(str(request_id), None)
             self._forget_request_join_key(str(request_id))
         return None, None
 
@@ -2902,6 +2967,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         try:
             self._register_donor_on_finish(request, request_id, block_ids)
         finally:
+            # After the registration, which is the only reader: vLLM reuses
+            # request ids, so a reason left behind would decide the next use.
+            self._capture_skipped_reasons.pop(request_id, None)
             # Last, so the join key outlives every event this finish emits.
             self._forget_request_join_key(request_id)
         return False, None
@@ -2952,6 +3020,25 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 reason="short_prompt",
                 prompt_tokens=len(token_ids),
                 min_prompt_tokens=int(self._config.min_prompt_tokens),
+            )
+            return
+
+        capture_skip_reason = self._capture_skipped_reasons.get(request_id)
+        if capture_skip_reason is not None:
+            # Nothing was captured for this request, so there is no KV any
+            # recipient could ever be served from it -- but it would still be
+            # embedded, indexed, and ranked against every later lookup. A
+            # served request repeated verbatim is its own nearest neighbour,
+            # so a handful of them fill the candidate cut at similarity 1.0
+            # and push the donor they were all served from out of it: the
+            # reuse stops, and the audit shows a plain miss with no cause.
+            self._stats["donor_registration_skipped_no_captured_kv"] += 1
+            self._audit_event(
+                "donor_registration_skipped",
+                request_id=request_id,
+                reason="no_captured_kv",
+                capture_skip_reason=capture_skip_reason,
+                prompt_tokens=len(token_ids),
             )
             return
 

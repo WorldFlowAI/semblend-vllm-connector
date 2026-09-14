@@ -113,7 +113,7 @@ Configuration knobs that matter for an overhead study:
 |---|---|
 | `min_prompt_tokens` | requests below this never touch the layer (no lookup, no capture) |
 | `register_donors: false` | lookup-only mode: no donor capture cost, reuse only from donors registered elsewhere |
-| `min_semantic_span` | smallest span worth materializing |
+| `min_semantic_span` | smallest span worth materializing. It is also a lookup gate: when fewer tokens are left after vLLM's own prefix-cache boundary than this, no span can clear the floor, so the connector skips the lookup and writes `lookup_skipped_remaining_below_min_span` instead of paying for an embedding |
 | `max_materialized_tokens` | cap on served tokens per request |
 | `evict_filled_blocks_from_prefix_cache` | default `true`: blocks this connector fills are dropped from vLLM's exact prefix cache. Set it to `false` **for measurement only** — with it off, the donor KV stays exact-matchable, so a later request whose tokens hash the same way is served approximate KV through vLLM's own lookup, which never consults this connector. The connector still tracks those blocks and writes a `prefix_cache_blocks_left_cached` audit event with the count, so a contaminated control run can be measured against a normal one. Compare the arms on `prefix_cache_distinct_blocks_left_cached` against `prefix_cache_distinct_blocks_evicted`: those count distinct physical blocks per request on both arms. The per-pass `blocks_left_cached` / `blocks_evicted` counts are not comparable across arms (see the audit contract). |
 

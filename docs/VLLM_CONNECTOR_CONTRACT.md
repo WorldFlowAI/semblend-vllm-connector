@@ -101,6 +101,52 @@ Do not count semantic hits or advertised loads as materialized KV reuse unless a
 matching `runtime_materialized` event exists and negative controls remain at
 zero.
 
+### Lookup skip reasons
+
+A request that never reaches the provider leaves one of these instead of a hit
+or a miss. Each carries the join key, `attempt`, `prompt_tokens`, and the
+numbers the decision was taken on, so a lookup rate is a ratio against a
+denominator that is written down rather than inferred. All of them are decided
+before any embedding is computed.
+
+| Event | Skipped because | Extra fields |
+| --- | --- | --- |
+| `lookup_skipped_incompatible_engine` | the startup gate declined this engine | `reason` |
+| `lookup_skipped_short_prompt` | the prompt is below `min_prompt_tokens` | `min_prompt_tokens` |
+| `lookup_skipped_exact_ratio` | vLLM's own prefix cache already covers enough of the prompt | `boundary`, `exact_ratio`, `threshold` |
+| `lookup_skipped_below_min_boundary` | the local prefix-cache boundary is below `min_boundary_tokens` | `boundary`, `min_boundary_tokens`, `block_size` |
+| `lookup_skipped_remaining_below_min_span` | fewer tokens are left after the boundary than `min_semantic_span` | `boundary`, `remaining`, `min_semantic_span`, `block_size` |
+
+The last one is semantic-span mode only, and it is not a variant of the
+exact-ratio gate: a deployment that sets `skip_when_exact_prefix_ratio_at_least`
+to 1.0 to keep every near-exact prompt eligible still cannot serve a tail
+shorter than its own span floor, because `block_align_spans` and the floor
+re-applied after the clamps both drop it. Without this gate that tail costs an
+embedding and a provider round trip per scheduling attempt and can only end in
+`semantic_span_boundary_missed`.
+
+### Donor registration skip reasons
+
+`donor_registered` is written when a finished request joins the donor pool;
+`donor_registration_skipped` with a `reason` is written when it does not.
+
+| `reason` | Meaning |
+| --- | --- |
+| `incompatible_engine` | the startup gate declined this engine, so its capture layout is unaddressable |
+| `register_donors_disabled` | `register_donors` is off |
+| `no_provider` | no provider is loaded |
+| `short_prompt` | the prompt is below `min_prompt_tokens` |
+| `no_captured_kv` | this request's KV capture was skipped, so it holds nothing to supply |
+
+`no_captured_kv` also carries `capture_skip_reason`, the reason from the
+request's own `capture_skipped` event. A donor with no captured KV can never be
+served from, but it would still be embedded, indexed and ranked: a request
+served by this connector skips its own capture, so a prompt re-issued verbatim
+produces a family of donors identical to each other that take every slot in the
+provider's candidate cut and push the one donor that does hold KV out of it.
+Providers must therefore drop donors whose `DonorRegistration.has_captured_kv`
+is false *before* the top-k cut, not after.
+
 ### Which prefix-cache number to compare across arms
 
 Both events carry the request's join key and two units, because the two arms

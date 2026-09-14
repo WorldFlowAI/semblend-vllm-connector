@@ -136,7 +136,14 @@ class SemBlendPipelineProvider:
         inputs and no router can reproduce it, so without the salt the donor
         is announced with no tenant identity anyone can match. Neither value
         is logged.
+
+        A donor that holds no captured KV is not forwarded at all. Ranking
+        inside the pipeline is the pipeline's -- this adapter passes a top_k
+        and sees only the winner -- so an unusable donor put into that index
+        can only take a slot in the cut away from a usable one.
         """
+        if not donor.has_captured_kv:
+            return
         kwargs = {
             "request_id": donor.donor_id,
             "token_ids": list(donor.token_ids),

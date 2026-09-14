@@ -113,6 +113,15 @@ class DonorRegistration:
     #: The registering request's RAW cache salt; see
     #: :class:`SemanticLookupRequest`.
     cache_salt: str | None = None
+    #: Whether the registering engine holds captured KV for this donor. A
+    #: donor registered with ``False`` can be discovered but can never supply
+    #: KV, so a provider ranking candidates must drop it *before* the top-k
+    #: cut: otherwise a family of such donors fills the cut and the one donor
+    #: that can supply KV never reaches the verification stage behind it. The
+    #: connector refuses to register a request whose capture was skipped, so
+    #: the flag guards the registration paths it does not own (a donor
+    #: announced by another engine, a provider that registers donors itself).
+    has_captured_kv: bool = True
     timestamp: float = field(default_factory=time.monotonic)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 

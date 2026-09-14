@@ -5,6 +5,47 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
+## Unreleased
+
+Both entries are fixes for behaviour measured live in phase-0 E6
+(2026-09-14) on stock vLLM 0.29, where a prompt served from a donor was
+re-issued verbatim five times.
+
+- A request whose KV capture was skipped is no longer registered as a donor.
+  It holds nothing any recipient could be served from, but it was still
+  embedded, indexed and ranked against every later lookup — and a request
+  this connector serves skips its own capture, so a verbatim re-issue
+  produced a donor identical to the previous re-issue. In the measured run
+  the fifth repeat found the recipient and the four repeats before it sitting
+  at similarity 1.0 in a `lookup_top_k` of five, and the seed they were all
+  served from no longer made the cut: the reuse stopped, and the audit showed
+  a plain miss with no cause in it. The skip is now audited as
+  `donor_registration_skipped` with `reason=no_captured_kv` and the
+  `capture_skip_reason` it inherits, and counted as
+  `donor_registration_skipped_no_captured_kv`. `register_donors` and
+  `capture_served_requests` are unchanged: with capture on, a served request
+  is captured and stays a donor.
+  Defensively, the ranking this connector owns now drops donors that hold no
+  captured KV *before* the top-k cut rather than after it, so such a donor
+  cannot take a slot in the cut from one that can supply KV.
+  `DonorRegistration` gained a `has_captured_kv` field (default `True`, every
+  existing construction site unchanged) to carry that fact to a provider.
+
+- The connector no longer runs a lookup that cannot end in a load. In
+  semantic-span mode, when fewer tokens are left after the block-aligned
+  boundary than `min_semantic_span`, no span can clear the floor
+  (`block_align_spans` drops it, and so does the floor re-applied after the
+  clamps), so the lookup is skipped with
+  `lookup_skipped_remaining_below_min_span` — the fields of its sibling skips
+  plus `remaining` and `min_semantic_span` — and counted as
+  `skipped_remaining_below_min_span_per_attempt`. In the measured run the
+  re-issues hit vLLM's own exact prefix cache for 3408 of 3411 tokens; with
+  `skip_when_exact_prefix_ratio_at_least` at 1.0 that ratio kept them
+  eligible, and each repeat paid an embedding plus a ~26 ms provider round
+  trip for three tokens before ending in `semantic_span_boundary_missed`. The
+  gate is scoped to semantic-span mode, where `min_semantic_span` is the only
+  place that floor applies.
+
 ## 0.2.3 - 2026-09-14
 
 Runs on stock vLLM 0.29 with prefix caching enabled: the eviction of
