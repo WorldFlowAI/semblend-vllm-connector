@@ -5,7 +5,14 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
-## Unreleased
+## 0.2.3 - 2026-09-14
+
+Runs on stock vLLM 0.29 with prefix caching enabled: the eviction of
+connector-filled blocks from the engine's exact prefix cache was measured
+live in phase-0 E5 (2026-09-14), where a verbatim re-issue of a served
+prompt was re-served through the connector from the clean donor rather
+than from the poisoned exact cache. The quickstart's prefix-caching
+guidance flips once E6 has measured the contamination arm.
 
 - The request's raw `cache_salt` now reaches SemBlend, which publishes it as a
   **tenant key** (`semblend:tenant:v1:<sha256(salt)[:32]>`, or the sentinel
