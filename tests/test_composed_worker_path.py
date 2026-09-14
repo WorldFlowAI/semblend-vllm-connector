@@ -8,10 +8,13 @@ contract, then slice -> rerotate -> inject at mid-request target slots,
 and finally compared against the oracle's K at target positions.
 """
 
-import torch
+import pytest
 
 from semblend_vllm_connector.connector import SemBlendVllmConnector
 from semblend_vllm_connector.types import MaterializationKind, PendingLoad
+
+# Real tensors: CI installs no torch and skips this module; the armed run has it.
+torch = pytest.importorskip("torch")
 
 HEADS, HEAD_DIM, THETA = 4, 128, 1_000_000.0
 BLOCK = 16

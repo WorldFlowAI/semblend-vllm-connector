@@ -189,8 +189,7 @@ def test_span_advertisement_zero_without_stored_donor_kv(tmp_path) -> None:
 
 
 def test_semantic_span_slice_rotates_k_and_preserves_v(tmp_path) -> None:
-    import torch
-
+    torch = pytest.importorskip("torch")
     from semblend_vllm_connector.semantic_span import rerotate_k
     from semblend_vllm_connector.types import PendingLoad
 
@@ -260,8 +259,7 @@ def test_rope_params_decline_non_default_rope_type(tmp_path) -> None:
 
 
 def test_semantic_span_slice_declines_without_rope_params(tmp_path) -> None:
-    import torch
-
+    torch = pytest.importorskip("torch")
     from semblend_vllm_connector.types import PendingLoad
 
     connector = _connector(tmp_path)
@@ -291,8 +289,7 @@ def test_extract_kv_gathers_without_full_layer_copy(tmp_path) -> None:
     """(take-9 regression) Extracting donor KV must gather selected slots
     via page/offset indexing; reshaping the whole paged layer copies it
     when strides are not flat-contiguous (multi-GiB OOM on capture)."""
-    import torch
-
+    torch = pytest.importorskip("torch")
     connector = _connector(tmp_path)
     # Non-MLA paged layer [2, pages, page_size, heads, dim]; the contract
     # is equality with the flat-reshape reference gather.
@@ -308,8 +305,7 @@ def test_extract_and_inject_handle_blocks_first_layout(tmp_path) -> None:
     [blocks, 2, block_size, H, D]; assuming K/V-first broadcast a
     pages-sized dimension (multi-GiB OOM). Round-trip must hold in BOTH
     layouts."""
-    import torch
-
+    torch = pytest.importorskip("torch")
     connector = _connector(tmp_path)
     slot_mapping = torch.tensor([5, 6, 13, 21])
 
@@ -404,8 +400,7 @@ def test_registered_kv_caches_feed_semantic_span_load(tmp_path, monkeypatch) -> 
     connector via register_kv_caches; layer.kv_cache is gone, so the
     forward-context walk finds nothing. The registered dict must feed the
     load path end to end: slice, re-rotate, inject, audit materialized."""
-    import torch
-
+    torch = pytest.importorskip("torch")
     audit_path = tmp_path / "audit.jsonl"
     connector = _worker_connector(tmp_path, audit_path)
 
@@ -453,8 +448,7 @@ def test_extract_and_inject_round_trip_packed_content_layout(tmp_path) -> None:
     """(take-11 regression) vLLM 0.26 flash_attn packs K/V into the content
     dim: (blocks, kv_heads, block_size, 2*head_size), K first half. The
     4-dim layout must gather, split, and round-trip exactly."""
-    import torch
-
+    torch = pytest.importorskip("torch")
     connector = _connector(tmp_path)
     layer = torch.randn(6, 2, 4, 16)  # blocks=6, H=2, bs=4, 2D=16
     slot_mapping = torch.tensor([5, 6, 13, 21])

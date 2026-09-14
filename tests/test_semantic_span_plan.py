@@ -10,6 +10,8 @@ contiguously from that boundary (zero when the boundary sits in a novel
 region), which is exactly the get_num_new_matched_tokens contract.
 """
 
+import pytest
+
 from semblend_vllm_connector.semantic_span import (
     BlockSpan,
     block_align_spans,
@@ -80,8 +82,7 @@ class TestRerotateK:
         raised 'Expected all tensors to be on the same device'. Meta-device
         K reproduces the mismatch without a GPU: any CPU-born intermediate
         poisons the op the same way."""
-        import torch
-
+        torch = pytest.importorskip("torch")
         from semblend_vllm_connector.semantic_span import rerotate_k
 
         k = torch.empty(4, 2, 16, device="meta")
@@ -90,8 +91,7 @@ class TestRerotateK:
 
     def test_rotation_composes_to_target_positions(self):
 
-        import torch
-
+        torch = pytest.importorskip("torch")
         from semblend_vllm_connector.semantic_span import rerotate_k, rope_cos_sin
 
         heads, head_dim, n, theta = 2, 32, 8, 10000.0
@@ -118,8 +118,7 @@ class TestRerotateK:
         torch.testing.assert_close(k_out, k_expected, atol=1e-4, rtol=1e-4)
 
     def test_zero_delta_is_identity(self):
-        import torch
-
+        torch = pytest.importorskip("torch")
         from semblend_vllm_connector.semantic_span import rerotate_k
 
         k = torch.randn(4, 2, 16)

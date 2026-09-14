@@ -7,6 +7,7 @@ import json
 import sys
 import types
 
+import pytest
 from test_connector_discovery import (
     FakeBlocks,
     FakeCacheConfig,
@@ -116,8 +117,7 @@ def test_memory_backend_round_trips_without_files(tmp_path, monkeypatch):
     tensor back from memory. The tiny metadata file still lands on disk
     because the scheduler-role connector (another process) reads the
     captured token count from it."""
-    import torch
-
+    torch = pytest.importorskip("torch")
     fake_st = types.ModuleType("safetensors")
     fake_st_torch = types.ModuleType("safetensors.torch")
     calls = {"save": 0, "load": 0}
@@ -191,8 +191,7 @@ def test_memory_backend_round_trips_without_files(tmp_path, monkeypatch):
 
 
 def test_memory_backend_evicts_oldest(tmp_path, monkeypatch):
-    import torch
-
+    torch = pytest.importorskip("torch")
     fake_st = types.ModuleType("safetensors")
     fake_st_torch = types.ModuleType("safetensors.torch")
     fake_st_torch.save_file = lambda *a, **k: None
@@ -228,8 +227,7 @@ def test_load_materializes_on_a_no_forward_step(tmp_path, monkeypatch):
     concurrent long prefills. The scheduler already counts the span as
     computed, so refusing to materialize there killed the engine
     ("SemBlend materialization requires forward_context.attn_metadata")."""
-    import torch
-
+    torch = pytest.importorskip("torch")
     fake_st = types.ModuleType("safetensors")
     fake_st_torch = types.ModuleType("safetensors.torch")
     fake_st_torch.save_file = lambda *a, **k: None
