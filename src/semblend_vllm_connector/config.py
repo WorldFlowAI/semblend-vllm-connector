@@ -190,10 +190,15 @@ class SemBlendVllmConfig:
             provider=str(extra.get("provider", os.environ.get("SEMBLEND_VLLM_PROVIDER", "local"))),
             provider_module=extra.get("provider_module")
             or os.environ.get("SEMBLEND_VLLM_PROVIDER_MODULE"),
-            provider_class=extra.get("provider_class") or os.environ.get("SEMBLEND_VLLM_PROVIDER_CLASS"),
+            provider_class=extra.get("provider_class")
+            or os.environ.get("SEMBLEND_VLLM_PROVIDER_CLASS"),
             model_id=str(model_id) if model_id is not None else None,
-            min_prompt_tokens=_read_int(extra, "min_prompt_tokens", "SEMBLEND_VLLM_MIN_PROMPT_TOKENS", 512),
-            min_semantic_span=_read_int(extra, "min_semantic_span", "SEMBLEND_VLLM_MIN_SEMANTIC_SPAN", 512),
+            min_prompt_tokens=_read_int(
+                extra, "min_prompt_tokens", "SEMBLEND_VLLM_MIN_PROMPT_TOKENS", 512
+            ),
+            min_semantic_span=_read_int(
+                extra, "min_semantic_span", "SEMBLEND_VLLM_MIN_SEMANTIC_SPAN", 512
+            ),
             min_boundary_tokens=_read_int(
                 extra, "min_boundary_tokens", "SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", 0
             ),
@@ -203,16 +208,18 @@ class SemBlendVllmConfig:
                 "SEMBLEND_VLLM_EVICT_FILLED_BLOCKS_FROM_PREFIX_CACHE",
                 True,
             ),
-            min_similarity=_read_float(extra, "min_similarity", "SEMBLEND_VLLM_MIN_SIMILARITY", 0.70),
+            min_similarity=_read_float(
+                extra, "min_similarity", "SEMBLEND_VLLM_MIN_SIMILARITY", 0.70
+            ),
             min_reuse_ratio=_read_float(
                 extra, "min_reuse_ratio", "SEMBLEND_VLLM_MIN_REUSE_RATIO", 0.50
             ),
             embedder_type=extra.get("embedder_type") or os.environ.get("SEMBLEND_VLLM_EMBEDDER"),
-            chunk_size=(
-                _read_int(extra, "chunk_size", "SEMBLEND_VLLM_CHUNK_SIZE", 0) or None
-            ),
+            chunk_size=(_read_int(extra, "chunk_size", "SEMBLEND_VLLM_CHUNK_SIZE", 0) or None),
             max_donors=_read_int(extra, "max_donors", "SEMBLEND_VLLM_MAX_DONORS", 10_000),
-            register_donors=_read_bool(extra, "register_donors", "SEMBLEND_VLLM_REGISTER_DONORS", True),
+            register_donors=_read_bool(
+                extra, "register_donors", "SEMBLEND_VLLM_REGISTER_DONORS", True
+            ),
             skip_when_exact_prefix_ratio_at_least=_read_float(
                 extra,
                 "skip_when_exact_prefix_ratio_at_least",
@@ -250,8 +257,12 @@ class SemBlendVllmConfig:
                 extra, "capture_served_requests", "SEMBLEND_VLLM_CAPTURE_SERVED_REQUESTS", False
             ),
             kv_storage_backend=str(
-                extra.get("kv_storage_backend", os.environ.get("SEMBLEND_VLLM_KV_STORAGE_BACKEND", "disk"))
-            ).strip().lower(),
+                extra.get(
+                    "kv_storage_backend", os.environ.get("SEMBLEND_VLLM_KV_STORAGE_BACKEND", "disk")
+                )
+            )
+            .strip()
+            .lower(),
             kv_memory_max_donors=_read_int(
                 extra, "kv_memory_max_donors", "SEMBLEND_VLLM_KV_MEMORY_MAX_DONORS", 16
             ),

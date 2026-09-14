@@ -89,7 +89,9 @@ def _span_result(donor_start, target_start, token_count):
 def _write_donor_capture(connector, request, donor_id, token_count) -> None:
     """Record the donor's captured length where the advertise path reads it."""
     namespace = namespace_for_request(
-        connector._config, connector._vllm_config, request  # noqa: SLF001
+        connector._config,
+        connector._vllm_config,
+        request,  # noqa: SLF001
     )
     os.makedirs(connector._donor_dir(donor_id, namespace), exist_ok=True)  # noqa: SLF001
     with open(connector._donor_metadata_path(donor_id, namespace), "w", encoding="utf-8") as f:  # noqa: SLF001

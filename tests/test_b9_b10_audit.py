@@ -159,9 +159,7 @@ def _read_events(tmp_path) -> list[dict]:
     if not path.exists():
         return []
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
@@ -183,11 +181,14 @@ def _matching(events, request_id, alternatives) -> list[dict]:
 
 
 def _trail(events: list[dict]) -> str:
-    return ", ".join(
-        f"{event.get('event')}(request_id={event.get('request_id')!r}, "
-        f"reason={event.get('reason') or event.get('declined_reason')!r})"
-        for event in events
-    ) or "<no audit events>"
+    return (
+        ", ".join(
+            f"{event.get('event')}(request_id={event.get('request_id')!r}, "
+            f"reason={event.get('reason') or event.get('declined_reason')!r})"
+            for event in events
+        )
+        or "<no audit events>"
+    )
 
 
 def _pick(event: dict, names: tuple[str, ...]):
@@ -249,8 +250,7 @@ def assert_exit_audited(events, request_id, alternatives, label) -> dict:
     assert matched, f"no {label} audit event for request {request_id!r}; trail: {_trail(events)}"
     names = [event.get("event") for event in matched]
     assert len(set(names)) == len(names), (
-        f"{label} audit events repeat for request {request_id!r}: {names}; "
-        f"trail: {_trail(events)}"
+        f"{label} audit events repeat for request {request_id!r}: {names}; trail: {_trail(events)}"
     )
     return matched[0]
 
@@ -311,11 +311,15 @@ def _span_connector(tmp_path, *, max_materialized_tokens: int = 4096):
 def _write_donor_capture(connector, request, donor_id: str, token_count: int) -> None:
     """The donor length the scheduler role reads back before planning a span."""
     namespace = namespace_for_request(
-        connector._config, connector._vllm_config, request  # noqa: SLF001
+        connector._config,
+        connector._vllm_config,
+        request,  # noqa: SLF001
     )
     os.makedirs(connector._donor_dir(donor_id, namespace), exist_ok=True)  # noqa: SLF001
     with open(
-        connector._donor_metadata_path(donor_id, namespace), "w", encoding="utf-8"  # noqa: SLF001
+        connector._donor_metadata_path(donor_id, namespace),
+        "w",
+        encoding="utf-8",  # noqa: SLF001
     ) as f:
         json.dump({"token_count": token_count}, f)
 
@@ -344,9 +348,7 @@ def _exact_prefix_connector(tmp_path, *, reusable_token_count: int = 96):
             reusable_token_count=reusable_token_count,
             materialization_kind=MaterializationKind.EXACT_PREFIX,
             block_refs=[
-                SemanticBlockRef(
-                    block_id="b0", start_token=0, token_count=reusable_token_count
-                )
+                SemanticBlockRef(block_id="b0", start_token=0, token_count=reusable_token_count)
             ],
         )
     )
@@ -518,9 +520,7 @@ def test_discovery_only_fallthrough_is_audited(tmp_path) -> None:
     assert connector.get_num_new_matched_tokens(recipient, 0) == (0, False)
 
     events = _read_events(tmp_path)
-    assert_audited_once(
-        events, "r1", (("discovery_only",),), "discovery-only fall-through"
-    )
+    assert_audited_once(events, "r1", (("discovery_only",),), "discovery-only fall-through")
 
 
 def test_boundary_outside_every_span_is_audited_once(tmp_path) -> None:
@@ -748,8 +748,7 @@ def test_every_event_for_one_request_shares_a_key_and_increasing_event_seq(tmp_p
             f"fields: {sorted(event)}"
         )
         assert _event_seq(event) is not None, (
-            f"audit event {event.get('event')!r} has no event sequence; "
-            f"fields: {sorted(event)}"
+            f"audit event {event.get('event')!r} has no event sequence; fields: {sorted(event)}"
         )
 
     recipient_events = _for_request(events, "r1")
@@ -823,8 +822,7 @@ def test_re_advertise_at_a_new_boundary_is_audited_with_its_boundary(tmp_path) -
     events = _read_events(tmp_path)
     advertises = _named(events, "r1", "exact_prefix_load_advertised")
     assert len(advertises) == 2, (
-        f"expected one advertise per distinct plan, got {len(advertises)}; "
-        f"trail: {_trail(events)}"
+        f"expected one advertise per distinct plan, got {len(advertises)}; trail: {_trail(events)}"
     )
     assert [event["boundary"] for event in advertises] == [0, 16]
     assert [event["tokens"] for event in advertises] == [96, 80]
@@ -1101,7 +1099,9 @@ def test_empty_store_list_stays_silent(tmp_path) -> None:
     connector.save_kv_layer("layers.0", object(), attn_metadata=object())
 
     events = _read_events(tmp_path)
-    assert [event for event in events if event.get("event") == "capture_metadata_unexpected_type"] == []
+    assert [
+        event for event in events if event.get("event") == "capture_metadata_unexpected_type"
+    ] == []
 
 
 def test_capture_base_missing_is_audited_once_per_store(tmp_path) -> None:

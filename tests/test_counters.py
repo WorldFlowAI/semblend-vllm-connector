@@ -126,7 +126,9 @@ def _exact_prefix_result(reusable_tokens):
 def _write_donor_capture(connector, request, donor_id, token_count) -> None:
     """Record the donor's captured length where the advertise path reads it."""
     namespace = namespace_for_request(
-        connector._config, connector._vllm_config, request  # noqa: SLF001
+        connector._config,
+        connector._vllm_config,
+        request,  # noqa: SLF001
     )
     os.makedirs(connector._donor_dir(donor_id, namespace), exist_ok=True)  # noqa: SLF001
     with open(connector._donor_metadata_path(donor_id, namespace), "w", encoding="utf-8") as f:  # noqa: SLF001
@@ -148,9 +150,7 @@ def _group_stub(**spec_fields):
     runs past the unresolved-config branch.
     """
     return types.SimpleNamespace(
-        kv_cache_groups=[
-            types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(**spec_fields))
-        ]
+        kv_cache_groups=[types.SimpleNamespace(kv_cache_spec=types.SimpleNamespace(**spec_fields))]
     )
 
 
@@ -185,9 +185,7 @@ def test_unresolved_kv_cache_config_counts_once_per_connector(tmp_path) -> None:
     )
 
 
-def test_missing_block_size_helper_counts_the_check_it_could_not_run(
-    tmp_path, monkeypatch
-) -> None:
+def test_missing_block_size_helper_counts_the_check_it_could_not_run(tmp_path, monkeypatch) -> None:
     """Without ``resolve_kv_cache_block_sizes`` the connector cannot confirm
     that vLLM hashes prefixes at the block size it indexes with. That leg is
     then unverified, not verified.
@@ -306,9 +304,7 @@ def test_packed_page_refusal_names_the_spec_as_its_source(tmp_path) -> None:
     with pytest.raises(RuntimeError, match="content dim"):
         connector._require_packed_content_dim((2, 8, 16, 64))  # noqa: SLF001
 
-    _assert_counted(
-        connector.stats_snapshot, "packed_head_slot_layout_refused_vs_kv_cache_spec", 1
-    )
+    _assert_counted(connector.stats_snapshot, "packed_head_slot_layout_refused_vs_kv_cache_spec", 1)
 
 
 def test_packed_page_refusal_from_the_hf_fallback_is_counted_separately(tmp_path) -> None:
@@ -322,9 +318,7 @@ def test_packed_page_refusal_from_the_hf_fallback_is_counted_separately(tmp_path
     with pytest.raises(RuntimeError, match="content dim"):
         connector._require_packed_content_dim((2, 8, 16, 64))  # noqa: SLF001
 
-    _assert_counted(
-        connector.stats_snapshot, "packed_head_slot_layout_refused_vs_hf_head_size", 1
-    )
+    _assert_counted(connector.stats_snapshot, "packed_head_slot_layout_refused_vs_hf_head_size", 1)
 
 
 def test_unknown_page_width_counts_the_skipped_check_once_per_engine(tmp_path) -> None:

@@ -42,4 +42,3 @@ def namespace_for_request(config: SemBlendVllmConfig, vllm_config: Any, request:
     raw = "|".join(f"{key}={value}" for key, value in sorted(parts.items()))
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     return f"vllm:{digest}"
-

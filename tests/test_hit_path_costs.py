@@ -87,7 +87,9 @@ def test_served_request_is_not_recaptured_by_default(tmp_path):
     assert matched > 0
     connector.update_state_after_alloc(recipient, FakeBlocks(([3, 4, 5],)), matched)
 
-    new_req = types.SimpleNamespace(req_id="r1", prompt_token_ids=list(range(100)), block_ids=([1, 2, 3, 4, 5],))
+    new_req = types.SimpleNamespace(
+        req_id="r1", prompt_token_ids=list(range(100)), block_ids=([1, 2, 3, 4, 5],)
+    )
     meta = connector.build_connector_meta(FakeSchedulerOutput(scheduled_new_reqs=[new_req]))
     assert [s.request_id for s in meta.stores] == []
 
@@ -101,7 +103,9 @@ def test_served_request_captured_when_policy_says_so(tmp_path):
     _write_capture(connector, recipient, "d1", 4096)
     matched, _ = connector.get_num_new_matched_tokens(recipient, 0)
     connector.update_state_after_alloc(recipient, FakeBlocks(([3, 4, 5],)), matched)
-    new_req = types.SimpleNamespace(req_id="r1", prompt_token_ids=list(range(100)), block_ids=([1, 2, 3, 4, 5],))
+    new_req = types.SimpleNamespace(
+        req_id="r1", prompt_token_ids=list(range(100)), block_ids=([1, 2, 3, 4, 5],)
+    )
     meta = connector.build_connector_meta(FakeSchedulerOutput(scheduled_new_reqs=[new_req]))
     assert [s.request_id for s in meta.stores] == ["r1"]
 
@@ -131,7 +135,8 @@ def test_memory_backend_round_trips_without_files(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "safetensors.torch", fake_st_torch)
 
     connector = SemBlendVllmConnector(
-        _config(tmp_path, kv_storage_backend="memory", kv_memory_max_donors=4), KVConnectorRole.WORKER
+        _config(tmp_path, kv_storage_backend="memory", kv_memory_max_donors=4),
+        KVConnectorRole.WORKER,
     )
 
     class _HF:
@@ -146,7 +151,13 @@ def test_memory_backend_round_trips_without_files(tmp_path, monkeypatch):
     # Capture donor "d1": slots for blocks 0,1 (8 tokens).
     from semblend_vllm_connector.types import PendingStore
 
-    store = PendingStore(request_id="d1", token_ids=list(range(8)), token_count=8, namespace="ns", block_ids=([0, 1],))
+    store = PendingStore(
+        request_id="d1",
+        token_ids=list(range(8)),
+        token_count=8,
+        namespace="ns",
+        block_ids=([0, 1],),
+    )
     connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[], stores=[store]))
     connector.save_kv_layer(layer_name, src_layer, object())
     assert calls["save"] == 0
@@ -156,8 +167,14 @@ def test_memory_backend_round_trips_without_files(tmp_path, monkeypatch):
     dst_layer = torch.zeros_like(src_layer)
     connector.register_kv_caches({layer_name: dst_layer})
     load = PendingLoad(
-        request_id="r1", donor_id="d1", token_count=8, materialization_kind=MaterializationKind.SEMANTIC_SPAN,
-        namespace="ns", block_ids=([3, 4],), donor_start=0, target_start=0,
+        request_id="r1",
+        donor_id="d1",
+        token_count=8,
+        materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+        namespace="ns",
+        block_ids=([3, 4],),
+        donor_start=0,
+        target_start=0,
     )
     connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[load], stores=[]))
     connector.start_load_kv(FakeForwardContext(attn_metadata=object()))
@@ -182,7 +199,8 @@ def test_memory_backend_evicts_oldest(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "safetensors", fake_st)
     monkeypatch.setitem(sys.modules, "safetensors.torch", fake_st_torch)
     connector = SemBlendVllmConnector(
-        _config(tmp_path, kv_storage_backend="memory", kv_memory_max_donors=2), KVConnectorRole.WORKER
+        _config(tmp_path, kv_storage_backend="memory", kv_memory_max_donors=2),
+        KVConnectorRole.WORKER,
     )
     layer_name = "l0"
     layer = torch.randn(2, 6, 4, 2, 16)
@@ -190,7 +208,13 @@ def test_memory_backend_evicts_oldest(tmp_path, monkeypatch):
     from semblend_vllm_connector.types import PendingStore
 
     for i, did in enumerate(("a", "b", "c")):
-        store = PendingStore(request_id=did, token_ids=list(range(4)), token_count=4, namespace="ns", block_ids=([i],))
+        store = PendingStore(
+            request_id=did,
+            token_ids=list(range(4)),
+            token_count=4,
+            namespace="ns",
+            block_ids=([i],),
+        )
         connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[], stores=[store]))
         connector.save_kv_layer(layer_name, layer, object())
     keys = list(connector._memory_store.keys())  # noqa: SLF001
@@ -213,7 +237,8 @@ def test_load_materializes_on_a_no_forward_step(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "safetensors", fake_st)
     monkeypatch.setitem(sys.modules, "safetensors.torch", fake_st_torch)
     connector = SemBlendVllmConnector(
-        _config(tmp_path, kv_storage_backend="memory", kv_memory_max_donors=4), KVConnectorRole.WORKER
+        _config(tmp_path, kv_storage_backend="memory", kv_memory_max_donors=4),
+        KVConnectorRole.WORKER,
     )
 
     class _HF:
@@ -226,15 +251,27 @@ def test_load_materializes_on_a_no_forward_step(tmp_path, monkeypatch):
     connector.register_kv_caches({layer_name: src_layer})
     from semblend_vllm_connector.types import PendingStore
 
-    store = PendingStore(request_id="d1", token_ids=list(range(8)), token_count=8, namespace="ns", block_ids=([0, 1],))
+    store = PendingStore(
+        request_id="d1",
+        token_ids=list(range(8)),
+        token_count=8,
+        namespace="ns",
+        block_ids=([0, 1],),
+    )
     connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[], stores=[store]))
     connector.save_kv_layer(layer_name, src_layer, object())
 
     dst_layer = torch.zeros_like(src_layer)
     connector.register_kv_caches({layer_name: dst_layer})
     load = PendingLoad(
-        request_id="r1", donor_id="d1", token_count=8, materialization_kind=MaterializationKind.SEMANTIC_SPAN,
-        namespace="ns", block_ids=([3, 4],), donor_start=0, target_start=0,
+        request_id="r1",
+        donor_id="d1",
+        token_count=8,
+        materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+        namespace="ns",
+        block_ids=([3, 4],),
+        donor_start=0,
+        target_start=0,
     )
     connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[load], stores=[]))
     connector.start_load_kv(FakeForwardContext(attn_metadata=None))

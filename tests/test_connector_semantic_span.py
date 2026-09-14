@@ -60,11 +60,7 @@ def _spanned_result():
         similarity=0.99,
         reusable_token_count=80,
         materialization_kind=MaterializationKind.SEMANTIC_SPAN,
-        segments=[
-            SemanticSegment(
-                donor_id="d1", donor_start=210, target_start=10, token_count=80
-            )
-        ],
+        segments=[SemanticSegment(donor_id="d1", donor_start=210, target_start=10, token_count=80)],
     )
 
 
@@ -90,7 +86,9 @@ def _write_donor_capture(connector, request, donor_id, token_count) -> None:
     from semblend_vllm_connector.namespace import namespace_for_request
 
     namespace = namespace_for_request(
-        connector._config, connector._vllm_config, request  # noqa: SLF001
+        connector._config,
+        connector._vllm_config,
+        request,  # noqa: SLF001
     )
     os.makedirs(connector._donor_dir(donor_id, namespace), exist_ok=True)  # noqa: SLF001
     path = connector._donor_metadata_path(donor_id, namespace)  # noqa: SLF001
@@ -161,11 +159,7 @@ def test_span_advertisement_capped_by_stored_donor_kv(tmp_path) -> None:
         similarity=0.99,
         reusable_token_count=80,
         materialization_kind=MaterializationKind.SEMANTIC_SPAN,
-        segments=[
-            SemanticSegment(
-                donor_id="d1", donor_start=10, target_start=10, token_count=80
-            )
-        ],
+        segments=[SemanticSegment(donor_id="d1", donor_start=10, target_start=10, token_count=80)],
     )
     connector._provider = _ScriptedProvider(result)  # noqa: SLF001
     recipient = FakeRequest("r1", list(range(100)))
@@ -392,15 +386,11 @@ def test_zero_layer_semantic_span_load_fails_loud(tmp_path, monkeypatch) -> None
 
     audit_path = tmp_path / "audit.jsonl"
     connector = _worker_connector(tmp_path, audit_path)
-    connector.bind_connector_metadata(
-        SemBlendConnectorMetadata(loads=[_semantic_span_load()])
-    )
+    connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[_semantic_span_load()]))
 
     # vLLM 0.26 shape: no register_kv_caches call yet, and the context walk
     # finds layers without a kv_cache attribute.
-    context = FakeForwardContext(
-        no_compile_layers={"layer0": types.SimpleNamespace(kv_cache=None)}
-    )
+    context = FakeForwardContext(no_compile_layers={"layer0": types.SimpleNamespace(kv_cache=None)})
     with pytest.raises(RuntimeError, match="materialized 0 layers"):
         connector.start_load_kv(context)
 

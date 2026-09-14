@@ -91,12 +91,7 @@ def rope_cos_sin(positions, head_dim: int, rope_theta: float):
 
     inv_freq = 1.0 / (
         rope_theta
-        ** (
-            torch.arange(
-                0, head_dim, 2, dtype=torch.float32, device=positions.device
-            )
-            / head_dim
-        )
+        ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=positions.device) / head_dim)
     )
     freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
     return freqs.cos(), freqs.sin()

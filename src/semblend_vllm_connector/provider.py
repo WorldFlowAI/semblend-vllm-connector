@@ -16,14 +16,11 @@ from semblend_vllm_connector.types import (
 
 
 class SemanticKvProvider(Protocol):
-    def lookup(self, request: SemanticLookupRequest) -> SemanticLookupResult | None:
-        ...
+    def lookup(self, request: SemanticLookupRequest) -> SemanticLookupResult | None: ...
 
-    def register_donor(self, donor: DonorRegistration) -> None:
-        ...
+    def register_donor(self, donor: DonorRegistration) -> None: ...
 
-    def clear_donors(self) -> None:
-        ...
+    def clear_donors(self) -> None: ...
 
 
 class LocalSemanticProvider:
@@ -51,9 +48,7 @@ class LocalSemanticProvider:
             if not donor_set:
                 continue
             similarity = len(query_set & donor_set) / len(query_set | donor_set)
-            if similarity >= self._min_similarity and (
-                best is None or similarity > best[0]
-            ):
+            if similarity >= self._min_similarity and (best is None or similarity > best[0]):
                 best = (similarity, donor)
 
         if best is None:
@@ -104,4 +99,3 @@ def load_provider(config: SemBlendVllmConfig) -> SemanticKvProvider:
         return SemBlendPipelineProvider(config)
 
     raise ValueError(f"Unsupported SemBlend vLLM provider: {config.provider}")
-

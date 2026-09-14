@@ -323,7 +323,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # equal). Engine-static: resolved once so its unresolved case is not
         # counted per layer.
         self._content_dim_expectation: tuple[int | None, str, bool] | None = None
-        self._block_size = int(getattr(getattr(vllm_config, "cache_config", None), "block_size", 16))
+        self._block_size = int(
+            getattr(getattr(vllm_config, "cache_config", None), "block_size", 16)
+        )
         self._prompt_tokenizer: Any | None = None
         self._prompt_tokenizer_failed = False
         # Startup checks that could not run (see _note_compat_check_incomplete):
@@ -344,9 +346,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             )
         )
         if self._compat_decline is not None:
-            logger.error(
-                "SemBlendVllmConnector declining all reuse: %s", self._compat_decline
-            )
+            logger.error("SemBlendVllmConnector declining all reuse: %s", self._compat_decline)
         if not self._config.evict_filled_blocks_from_prefix_cache:
             logger.warning(
                 "SemBlendVllmConnector is leaving the blocks it fills in vLLM's "
@@ -386,9 +386,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         """
         self._compat_check_incomplete.append(reason)
         self._stats[f"compat_check_incomplete_{reason}"] += 1
-        logger.warning(
-            "SemBlendVllmConnector engine compatibility check incomplete: %s", reason
-        )
+        logger.warning("SemBlendVllmConnector engine compatibility check incomplete: %s", reason)
 
     def _check_engine_compatibility(self, vllm_config: "VllmConfig") -> str | None:
         """Why this engine configuration cannot be served; None when it can.
@@ -498,9 +496,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         try:
             from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 
-            _, hash_block_size = resolve_kv_cache_block_sizes(
-                self._kv_cache_config, vllm_config
-            )
+            _, hash_block_size = resolve_kv_cache_block_sizes(self._kv_cache_config, vllm_config)
         except ImportError:
             self._note_compat_check_incomplete("block_size_resolution_unavailable")
             return None
@@ -770,9 +766,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 target_start=int(target_start),
                 token_count=int(token_count),
             )
-            raise RuntimeError(
-                f"SemBlend requires a single KV-cache group, got {len(block_ids)}"
-            )
+            raise RuntimeError(f"SemBlend requires a single KV-cache group, got {len(block_ids)}")
         # The destination is [target_start, target_start + token_count). Block
         # index 0 holds the request's shared, reference-counted exact-prefix
         # region; writing there corrupts every other request holding it and
@@ -971,9 +965,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             heads = dst_shape[1]
             head_size = dst_shape[3] // 2
             kv = src_kv_cache.reshape(2, n, heads, head_size)
-            dst_kv_cache_layer[pages, :, offsets, :] = torch.cat(
-                (kv[0], kv[1]), dim=-1
-            )
+            dst_kv_cache_layer[pages, :, offsets, :] = torch.cat((kv[0], kv[1]), dim=-1)
             return
         if dst_shape[0] == 2:
             dst_kv_cache_layer[:, pages, offsets, ...] = src_kv_cache.reshape(
@@ -984,9 +976,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 2, n, *dst_kv_cache_layer.shape[3:]
             ).transpose(0, 1)
         else:
-            raise RuntimeError(
-                f"unrecognized paged KV layout {tuple(dst_shape)}"
-            )
+            raise RuntimeError(f"unrecognized paged KV layout {tuple(dst_shape)}")
 
     def _extract_kv_from_layer(self, kv_layer: Any, slot_mapping: Any, attn_metadata: Any) -> Any:
         # Index pages/offsets directly: reshaping the whole paged layer
@@ -1026,9 +1016,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # [n, 2, heads, dim]; put K/V first.
             gathered = kv_layer[pages, :, offsets, ...].transpose(0, 1)
         else:
-            raise RuntimeError(
-                f"unrecognized paged KV layout {tuple(layer_shape)}"
-            )
+            raise RuntimeError(f"unrecognized paged KV layout {tuple(layer_shape)}")
         return gathered.reshape(2, gathered.shape[1], -1)
 
     def _layer_filename(self, donor_id: str, namespace: str, layer_name: str) -> str:
@@ -1244,9 +1232,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             try:
                 result = self._provider.lookup(lookup)
             except Exception as exc:
-                logger.exception(
-                    "SemBlend provider lookup failed; falling back to normal prefill"
-                )
+                logger.exception("SemBlend provider lookup failed; falling back to normal prefill")
                 self._stats["provider_errors_total"] += 1
                 # Per attempt, not per request: nothing is memoized on the
                 # error path, so the next attempt re-runs the lookup and can
@@ -1331,10 +1317,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     self._stats["discovery_only_hits_total"] += 1
             return 0, False
 
-        if (
-            self._config.mode == ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL
-            and result.segments
-        ):
+        if self._config.mode == ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL and result.segments:
             if num_computed_tokens % self._block_size != 0:
                 # supply_at_boundary counts from the next block edge, but the
                 # scheduler adds what this hook returns to the boundary itself.
@@ -1382,9 +1365,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                         "donor_start": seg.donor_start,
                     }
                 )
-            spans = block_align_spans(
-                raw_spans, self._block_size, self._config.min_semantic_span
-            )
+            spans = block_align_spans(raw_spans, self._block_size, self._config.min_semantic_span)
             snapped_spans = [
                 {
                     "target_start": span.target_start,
@@ -1398,8 +1379,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             )
             token_count = min(
                 token_count,
-                (self._config.max_materialized_tokens // self._block_size)
-                * self._block_size,
+                (self._config.max_materialized_tokens // self._block_size) * self._block_size,
             )
             # The advertised count is added straight into num_computed_tokens
             # and the scheduler then asserts num_new_tokens > 0, so a span
@@ -1407,8 +1387,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # same cacheable prefix vLLM's own local lookup respects.
             headroom = max(
                 0,
-                _cacheable_prefix_tokens(len(token_ids), self._block_size)
-                - num_computed_tokens,
+                _cacheable_prefix_tokens(len(token_ids), self._block_size) - num_computed_tokens,
             )
             if token_count > headroom:
                 self._stats["semantic_span_clamped_to_prompt_headroom_per_attempt"] += 1
@@ -1611,8 +1590,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             #     prompt a token to compute, so the cacheable-prefix rule (one
             #     token held back) does not belong on it.
             reusable_end = (
-                min(int(result.reusable_token_count), len(token_ids))
-                // self._block_size
+                min(int(result.reusable_token_count), len(token_ids)) // self._block_size
             ) * self._block_size
             #   prompt bound - the advertised count is added to
             #     num_computed_tokens and the scheduler then asserts there is at
@@ -1622,8 +1600,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             token_count = max(0, min(reusable_end, prompt_end) - num_computed_tokens)
             #   operator bound - a budget of tokens to write, not a position.
             token_count = (
-                min(token_count, self._config.max_materialized_tokens)
-                // self._block_size
+                min(token_count, self._config.max_materialized_tokens) // self._block_size
             ) * self._block_size
             if token_count <= 0:
                 # Attempt-scoped: the window shrinks as the local prefix grows,
@@ -2072,9 +2049,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         no later recipient could match, and the reasons need different fixes.
         """
         self._stats[f"capture_skipped_{reason}"] += 1
-        self._audit_event(
-            "capture_skipped", request_id=request_id, reason=reason, **fields
-        )
+        self._audit_event("capture_skipped", request_id=request_id, reason=reason, **fields)
 
     def _build_store_metadata(self, scheduler_output: "SchedulerOutput") -> list[PendingStore]:
         if not self._materialization_enabled():
@@ -2120,9 +2095,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 continue
             block_ids = _normalize_block_ids(getattr(new_req, "block_ids", None))
             if block_ids is None:
-                self._note_capture_skipped(
-                    request_id, "no_block_ids", prompt_tokens=len(token_ids)
-                )
+                self._note_capture_skipped(request_id, "no_block_ids", prompt_tokens=len(token_ids))
                 continue
             state = _CaptureState(
                 token_ids=token_ids,
@@ -2298,7 +2271,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             block_ids=state.block_ids,
         )
 
-    def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> SemBlendConnectorMetadata:
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> SemBlendConnectorMetadata:
         loads: list[PendingLoad] = []
         for load in self._pending_loads.values():
             if load.block_ids is None:
@@ -2453,9 +2428,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             self._stats["semantic_span_declined_no_rope_params"] += 1
             return None, "no_rope_params"
         theta, head_dim = params
-        window = src_kv_cache[
-            :, load.donor_start : load.donor_start + load.token_count, ...
-        ]
+        window = src_kv_cache[:, load.donor_start : load.donor_start + load.token_count, ...]
         if window.shape[1] < load.token_count:
             self._stats["semantic_span_declined_short_donor"] += 1
             return None, "short_donor"
@@ -2473,18 +2446,14 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
     def register_kv_caches(self, kv_caches: dict) -> None:
         self._registered_kv_caches = dict(kv_caches)
-        self._audit_event(
-            "kv_caches_registered", layer_count=len(self._registered_kv_caches)
-        )
+        self._audit_event("kv_caches_registered", layer_count=len(self._registered_kv_caches))
 
     def _iter_kv_layers(self, forward_context):
         """Yield (layer_name, dst_kv_cache_tensor) across vLLM versions."""
         if self._registered_kv_caches:
             yield from self._registered_kv_caches.items()
             return
-        for layer_name, layer in getattr(
-            forward_context, "no_compile_layers", {}
-        ).items():
+        for layer_name, layer in getattr(forward_context, "no_compile_layers", {}).items():
             kv_cache_attr = getattr(layer, "kv_cache", None)
             if kv_cache_attr is None:
                 continue
@@ -2594,9 +2563,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                         span_declines[decline_reason or "unknown"] += 1
                         continue
                 elif self._is_mla_metadata(layer_metadata):
-                    src_kv_cache = src_kv_cache[
-                        donor_start : donor_start + load.token_count, ...
-                    ]
+                    src_kv_cache = src_kv_cache[donor_start : donor_start + load.token_count, ...]
                 else:
                     src_kv_cache = src_kv_cache[
                         :, donor_start : donor_start + load.token_count, ...
@@ -2713,7 +2680,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
 
-    def save_kv_layer(self, layer_name: str, kv_layer: Any, attn_metadata: Any, **kwargs: Any) -> None:
+    def save_kv_layer(
+        self, layer_name: str, kv_layer: Any, attn_metadata: Any, **kwargs: Any
+    ) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, SemBlendConnectorMetadata):
             # Mirror of start_load_kv: another connector's metadata reached this
@@ -2780,9 +2749,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._write_captured_layer(store, layer_name, host_kv, actual_token_count)
         self._capture_progress[store.request_id] = {**progress, layer_name: actual_token_count}
 
-    def _note_capture_base_missing(
-        self, store: PendingStore, layer_name: str, start: int
-    ) -> None:
+    def _note_capture_base_missing(self, store: PendingStore, layer_name: str, start: int) -> None:
         """Record, once per store, that a chunked capture restarted from zero.
 
         The earlier chunks this layer appended to are gone (evicted donor,
@@ -2822,7 +2789,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         os.makedirs(donor_dir, exist_ok=True)
         # The scheduler-role connector runs in another process and reads
         # the captured length from this file for both backends.
-        with open(self._donor_metadata_path(store.request_id, store.namespace), "w", encoding="utf-8") as f:
+        with open(
+            self._donor_metadata_path(store.request_id, store.namespace), "w", encoding="utf-8"
+        ) as f:
             json.dump({"token_count": token_count}, f)
         if self._config.kv_storage_backend == "memory":
             key = self._storage_key(store.request_id, store.namespace)
@@ -2878,9 +2847,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
     def wait_for_save(self) -> None:
         return
 
-    def get_finished(
-        self, finished_req_ids: set[str]
-    ) -> tuple[set[str] | None, set[str] | None]:
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         # Worker side. A finished request sends no more prefill chunks, so
         # its capture progress can go; the captured donor itself stays.
         #

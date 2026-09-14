@@ -321,9 +321,7 @@ def test_real_packed_head_slot_spec_declines(tmp_path, kv_cache_interface) -> No
     assert type(packed) is kv_cache_interface.FullAttentionSpec
     assert packed.num_heads != packed.num_kv_heads
 
-    connector = _connector(
-        tmp_path, kv_cache_config=_kv_cache_config(kv_cache_interface, packed)
-    )
+    connector = _connector(tmp_path, kv_cache_config=_kv_cache_config(kv_cache_interface, packed))
 
     assert connector._compat_decline is not None  # noqa: SLF001
     assert "head slots" in connector._compat_decline  # noqa: SLF001
@@ -339,9 +337,7 @@ def test_real_sliding_window_spec_declines(tmp_path, kv_cache_interface) -> None
         block_size=4, num_kv_heads=8, head_size=128, dtype=torch.float16, sliding_window=512
     )
 
-    connector = _connector(
-        tmp_path, kv_cache_config=_kv_cache_config(kv_cache_interface, sliding)
-    )
+    connector = _connector(tmp_path, kv_cache_config=_kv_cache_config(kv_cache_interface, sliding))
 
     assert connector._compat_decline is not None  # noqa: SLF001
     assert "SlidingWindowSpec" in connector._compat_decline  # noqa: SLF001

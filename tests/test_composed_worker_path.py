@@ -19,9 +19,7 @@ BLOCK = 16
 
 def oracle_rotate(k_raw, positions):
     """vLLM RotaryEmbedding.forward_native, neox style, transcribed."""
-    inv_freq = 1.0 / (
-        THETA ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
-    )
+    inv_freq = 1.0 / (THETA ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM))
     freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
     cos, sin = freqs.cos(), freqs.sin()
     x1 = k_raw[..., : HEAD_DIM // 2]
@@ -64,9 +62,7 @@ def test_composed_worker_path_matches_vllm_convention_oracle():
     k_donor = oracle_rotate(k_raw, torch.arange(0, donor_tokens))
 
     # Extract-contract file layout: [2, n, H*D] flattened.
-    src_kv = torch.stack(
-        (k_donor.reshape(donor_tokens, -1), v_ref.reshape(donor_tokens, -1))
-    )
+    src_kv = torch.stack((k_donor.reshape(donor_tokens, -1), v_ref.reshape(donor_tokens, -1)))
 
     load = PendingLoad(
         request_id="r",
@@ -80,9 +76,7 @@ def test_composed_worker_path_matches_vllm_convention_oracle():
     )
 
     out = connector._semantic_span_slice(src_kv, load, attn_metadata=object())
-    assert out is not None, (
-        f"slice declined: {connector._stats}"
-    )
+    assert out is not None, f"slice declined: {connector._stats}"
 
     # Inject into a paged kv_first layer and read back at the load slots.
     n_blocks = (span + BLOCK - 1) // BLOCK + 130

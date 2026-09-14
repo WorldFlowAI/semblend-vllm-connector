@@ -108,8 +108,7 @@ def _fill_missing_torch_symbols() -> tuple[str, ...]:
 
     torch.library.infer_schema = _infer_schema_unavailable
     return (
-        f"torch {torch.__version__} predates torch.library.infer_schema, "
-        "filled in for import only",
+        f"torch {torch.__version__} predates torch.library.infer_schema, filled in for import only",
     )
 
 
@@ -169,10 +168,7 @@ def _probe_vllm_types() -> VllmTypes:
     if root is None:
         return VllmTypes(
             origin="none",
-            reason=(
-                "vLLM is not installed and no usable source tree was named by "
-                f"${SOURCE_ENV}"
-            ),
+            reason=(f"vLLM is not installed and no usable source tree was named by ${SOURCE_ENV}"),
         )
     return _source_vllm(root)
 
@@ -193,8 +189,7 @@ def pytest_configure(config) -> None:
     if VLLM_TYPES.available or not os.environ.get(REQUIRE_ENV):
         return
     raise pytest.UsageError(
-        f"${REQUIRE_ENV} is set, but the real vLLM types could not be loaded: "
-        f"{VLLM_TYPES.reason}"
+        f"${REQUIRE_ENV} is set, but the real vLLM types could not be loaded: {VLLM_TYPES.reason}"
     )
 
 

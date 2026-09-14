@@ -213,7 +213,9 @@ class FakeEngine:
         """Publish the donor's captured length, as save_kv_layer does."""
         connector = self.scheduler
         namespace = namespace_for_request(
-            connector._config, connector._vllm_config, request  # noqa: SLF001
+            connector._config,
+            connector._vllm_config,
+            request,  # noqa: SLF001
         )
         os.makedirs(connector._donor_dir(donor_id, namespace), exist_ok=True)  # noqa: SLF001
         path = connector._donor_metadata_path(donor_id, namespace)  # noqa: SLF001
@@ -230,9 +232,7 @@ def run_load(
 ) -> LoadOutcome:
     """Drive one scheduling step end to end, in the engine's own call order."""
     advertised, async_load = engine.scheduler.get_num_new_matched_tokens(request, boundary)
-    engine.scheduler.update_state_after_alloc(
-        request, FakeBlocks((list(block_ids),)), advertised
-    )
+    engine.scheduler.update_state_after_alloc(request, FakeBlocks((list(block_ids),)), advertised)
     metadata = engine.scheduler.build_connector_meta(FakeSchedulerOutput())
 
     before = {name: layer.clone() for name, layer in engine.layers.items()}
@@ -338,9 +338,7 @@ def test_load_at_a_nonzero_boundary_writes_exactly_the_advertised_window(
     )
 
 
-def test_blocks_before_the_boundary_are_byte_identical_after_a_load(
-    tmp_path, monkeypatch
-) -> None:
+def test_blocks_before_the_boundary_are_byte_identical_after_a_load(tmp_path, monkeypatch) -> None:
     """The blocks under [0, B) came from vLLM's exact prefix cache and are
     shared by reference count with every other request holding that prefix.
     A load must not touch one byte of them."""
@@ -378,9 +376,7 @@ def test_loaded_window_carries_the_rerotated_donor_kv(tmp_path, monkeypatch) -> 
         torch.testing.assert_close(written, torch.cat((k, v), dim=-1), msg=name)
 
 
-def test_boundary_zero_load_writes_the_head_of_the_target_frame(
-    tmp_path, monkeypatch
-) -> None:
+def test_boundary_zero_load_writes_the_head_of_the_target_frame(tmp_path, monkeypatch) -> None:
     """The degenerate case where target frame and block list coincide. It has
     always worked; it is here so a destination fix cannot regress it."""
     engine = _span_engine(tmp_path, monkeypatch, target_start=0)
@@ -407,9 +403,7 @@ def test_declined_lookup_leaves_every_kv_byte_untouched(tmp_path, monkeypatch) -
     assert changed_slots(outcome.before, outcome.after) == set()
 
 
-def test_stock_four_dim_view_packs_k_then_v_in_the_content_dim(
-    tmp_path, monkeypatch
-) -> None:
+def test_stock_four_dim_view_packs_k_then_v_in_the_content_dim(tmp_path, monkeypatch) -> None:
     """Pin the two shape facts the write path infers from, so a layout change
     fails here rather than silently in a serving run.
 

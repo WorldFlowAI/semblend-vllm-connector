@@ -56,7 +56,6 @@ except Exception:  # pragma: no cover - the fallback is covered by local tests.
             return self._connector_metadata
 
 
-
 def get_virtual_engine(forward_context) -> int:
     """vLLM removed ForwardContext.virtual_engine (single-engine v1 path);
     older versions carry it. Default to engine 0 when absent."""

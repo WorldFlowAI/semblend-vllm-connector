@@ -33,11 +33,7 @@ def _segments_from_position_map(result) -> list | None:
     segments = []
     run_start = 0
     for i in range(1, len(donors) + 1):
-        if (
-            i == len(donors)
-            or donors[i] - donors[i - 1] != 1
-            or targets[i] - targets[i - 1] != 1
-        ):
+        if i == len(donors) or donors[i] - donors[i - 1] != 1 or targets[i] - targets[i - 1] != 1:
             length = i - run_start
             if length >= 1:
                 segments.append(
@@ -112,9 +108,7 @@ class SemBlendPipelineProvider:
         return SemanticLookupResult(
             donor_id=result.donor_id,
             similarity=float(result.similarity),
-            reusable_token_count=(
-                sum(seg.token_count for seg in segments) if segments else 0
-            ),
+            reusable_token_count=(sum(seg.token_count for seg in segments) if segments else 0),
             materialization_kind=MaterializationKind.DISCOVERY_ONLY,
             donor_token_ids=list(result.donor_tokens or []),
             segments=segments,

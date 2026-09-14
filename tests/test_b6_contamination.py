@@ -96,9 +96,7 @@ class FakeBlockPool:
 
     def __init__(self, num_gpu_blocks: int = 1024, hash_block_size: int = BLOCK_SIZE) -> None:
         self.hashed: frozenset[int] = frozenset()
-        self.blocks = [
-            _FakeBlock(self, idx, is_null=(idx == 0)) for idx in range(num_gpu_blocks)
-        ]
+        self.blocks = [_FakeBlock(self, idx, is_null=(idx == 0)) for idx in range(num_gpu_blocks)]
         self.null_block = self.blocks[0]
         self.hash_block_size = hash_block_size
         self.enable_caching = True
@@ -226,7 +224,9 @@ def _bound_connector(tmp_path, **overrides) -> tuple[SemBlendVllmConnector, Fake
 def _write_donor_capture(connector, request, donor_id: str = "d1", tokens: int = 4096) -> None:
     """Record a donor KV capture on disk; the advertise path trims spans to it."""
     namespace = namespace_for_request(
-        connector._config, connector._vllm_config, request  # noqa: SLF001
+        connector._config,
+        connector._vllm_config,
+        request,  # noqa: SLF001
     )
     os.makedirs(connector._donor_dir(donor_id, namespace), exist_ok=True)  # noqa: SLF001
     path = connector._donor_metadata_path(donor_id, namespace)  # noqa: SLF001
@@ -298,9 +298,7 @@ def _audit_events(tmp_path) -> list[dict]:
     if not path.exists():
         return []
     return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
     ]
 
 
