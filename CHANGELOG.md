@@ -5,6 +5,19 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
+## Unreleased
+
+- Blocks the connector fills are evicted from vLLM's exact prefix cache on
+  the step they are filled and on every later step the request runs, so
+  approximate KV can no longer be served to a later request through the
+  engine's own exact match. Evictions are counted and audited per load.
+  This is what allows the semantic-span mode to run with prefix caching
+  enabled; the quickstart still says to disable it until the change has
+  been measured on a GPU.
+- `min_boundary_tokens` is enforced ahead of the provider lookup, in every
+  mode: set it to the block size so unserved requests prime the shared
+  prefix cleanly.
+
 ## 0.2.2 - 2026-09-13
 
 Correctness release for the semantic-span path on stock vLLM 0.29. Every

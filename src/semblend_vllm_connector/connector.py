@@ -66,6 +66,37 @@ class _CaptureState:
     captured_end: int
 
 
+@dataclass(frozen=True)
+class _FilledBlocks:
+    """The blocks one committed load filled, tracked until the request ends.
+
+    vLLM hashes these blocks under the *recipient's* own token ids and inserts
+    them into its exact prefix cache inside the same ``allocate_slots`` call
+    that allocated them, so a later request can match approximate KV through
+    the engine's own lookup -- which runs before this connector is consulted,
+    with no gate, no TTL, no tenant check and no decision to record. They are
+    therefore evicted from that hash table on the step they are filled and
+    again on every later step the request runs, because a poisoned block's
+    hash is the parent of every block hashed after it: the contaminated set is
+    the fill plus the whole rest of the request, decode included.
+
+    ``first_approx_block`` is the block index where the fill starts; blocks
+    before it are genuine local prefix-cache hits and must keep their entries.
+    ``evicted`` is what has actually been removed, so no block is handed to
+    ``evict_blocks`` twice.
+    """
+
+    block_ids: tuple[list[int], ...]
+    first_approx_block: int
+    donor_id: str
+    namespace: str
+    evicted: frozenset[int]
+    # Everything before this index is already evicted, so a later pass scans
+    # only the tail. It never skips an uncached block: it advances only past
+    # a contiguous run that was actually removed.
+    scan_from: int = 0
+
+
 def _cacheable_prefix_tokens(num_tokens: int, block_size: int) -> int:
     """Return the largest block-aligned prefix vLLM can treat as computed."""
     eligible = max(num_tokens - 1, 0)
@@ -212,6 +243,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # Scheduler-side state for donors still in prefill, so the chunks
         # after admission can be captured too.
         self._capture_state: dict[str, _CaptureState] = {}
+        # The scheduler's GPU block pool, bound below; the only handle a
+        # connector gets on the exact prefix cache its fills are inserted into.
+        self._gpu_block_pool: Any = None
+        # Requests whose filled blocks are being kept out of that cache.
+        self._filled_blocks: dict[str, _FilledBlocks] = {}
         self._last_attn_metadata: Any = None
         # vllm-fork capability gate: re-consult this connector at chunked
         # continuation boundaries (mid-prompt external KV). Only the
@@ -977,6 +1013,40 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 )
             return 0, False
 
+        if num_computed_tokens < self._config.min_boundary_tokens:
+            # Attempt-scoped for the same reason as the gate above: the
+            # boundary moves between attempts, so a request declined here can
+            # still be served at a later one.
+            #
+            # Why the floor exists at all: every block this connector fills is
+            # evicted from vLLM's exact prefix cache (see
+            # _evict_filled_blocks), so a request served from boundary 0
+            # contributes nothing to that cache. If every servable request
+            # were served that way, the prompt prefix those requests share
+            # would never be cached, every boundary would stay 0, and the
+            # mid-prompt reuse this connector exists for could never arise.
+            # Declining below the floor lets those requests prefill normally
+            # and prime the shared prefix; it also keeps a boundary-alignment
+            # measurement from being a statement about our own threshold.
+            self._stats["skipped_below_min_boundary_per_attempt"] += 1
+            self._audit_event(
+                "lookup_skipped_below_min_boundary",
+                request_id=request_id,
+                boundary=int(num_computed_tokens),
+                min_boundary_tokens=int(self._config.min_boundary_tokens),
+                block_size=self._block_size,
+                prompt_tokens=len(token_ids),
+            )
+            if self._config.log_decisions:
+                logger.info(
+                    "SemBlend lookup skipped request_id=%s reason=below_min_boundary "
+                    "boundary=%d min_boundary_tokens=%d",
+                    request_id,
+                    num_computed_tokens,
+                    self._config.min_boundary_tokens,
+                )
+            return 0, False
+
         if self._provider is None:
             if first_attempt:
                 self._stats["skipped_no_provider"] += 1
@@ -1361,6 +1431,118 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             )
         return 0, False
 
+    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
+        """Keep the scheduler's block pool so filled blocks can be evicted.
+
+        The scheduler calls this unconditionally once it has built the KV cache
+        manager. It is the only handle a connector gets on the prefix-cache
+        hash table its fills are inserted into, so without it the fills stay
+        exact-matchable by unrelated requests.
+        """
+        self._gpu_block_pool = gpu_block_pool
+
+    @staticmethod
+    def _block_is_cached(pool: Any, block_id: int) -> bool:
+        """Whether the pool's prefix-cache hash table currently names a block."""
+        blocks = getattr(pool, "blocks", None)
+        if blocks is None or block_id >= len(blocks):
+            return False
+        if getattr(blocks[block_id], "block_hash", None) is not None:
+            return True
+        return block_id in (getattr(pool, "cached_block_hashes_by_block", None) or ())
+
+    def _evict_filled_blocks(
+        self, request_id: str, state: _FilledBlocks, *, phase: str
+    ) -> _FilledBlocks:
+        """Drop this request's filled blocks from vLLM's exact prefix cache.
+
+        ``evict_blocks`` removes only the hash entry: ref_cnt is untouched and
+        nothing is freed, so the request keeps reading the KV it was served and
+        only the *sharing* of it stops.
+        """
+        pool = self._gpu_block_pool
+        if pool is None:
+            # Counts passes, not requests: this runs again every step the
+            # request is scheduled, so it carries its own unit in the name.
+            if not self._stats["prefix_cache_eviction_passes_without_pool"]:
+                logger.warning(
+                    "SemBlend cannot evict filled blocks: no GPU block pool was bound; "
+                    "loaded KV stays exact-matchable in vLLM's prefix cache"
+                )
+            self._stats["prefix_cache_eviction_passes_without_pool"] += 1
+            return state
+        # FullAttentionManager.cache_blocks re-registers the block holding the
+        # partial tail on every call when the prefix-hash unit is finer than
+        # the block size, and that path is not gated by num_cached_block: it
+        # would put back, once per step, exactly what is evicted here. The
+        # startup gate already declines such an engine (_check_hash_block_size),
+        # so this can only trip if that gate was bypassed -- and a silent skip
+        # here would leak approximate KV into the exact cache.
+        hash_block_size = int(
+            getattr(pool, "hash_block_size", self._block_size) or self._block_size
+        )
+        assert hash_block_size == self._block_size, (
+            f"prefix hash block size {hash_block_size} != connector block_size "
+            f"{self._block_size}: evicted blocks would be re-registered every step"
+        )
+        null_block_id = getattr(getattr(pool, "null_block", None), "block_id", None)
+        start = max(state.first_approx_block, state.scan_from)
+        to_evict = {
+            block_id
+            for group in state.block_ids
+            for block_id in group[start:]
+            # _maybe_evict_cached_block reports the block to the pool's metrics
+            # collector *before* it checks for a hash, so eviction is not
+            # idempotent: a second pass over an id, the shared null placeholder,
+            # or an id that is not cached yet would destroy that block's
+            # residency tracking for nothing. An uncached block is revisited on
+            # a later step instead, once vLLM has actually hashed it.
+            if block_id != null_block_id
+            and block_id not in state.evicted
+            and self._block_is_cached(pool, block_id)
+        }
+        if not to_evict:
+            return state
+        try:
+            pool.evict_blocks(to_evict)
+        except Exception:
+            # Per pass, like the unbound-pool counter beside it; the trace is
+            # logged once so a persistent failure does not flood the engine log.
+            if not self._stats["prefix_cache_eviction_error_passes"]:
+                logger.exception("SemBlend prefix-cache eviction failed")
+            self._stats["prefix_cache_eviction_error_passes"] += 1
+            return state
+        self._stats["prefix_cache_blocks_evicted"] += len(to_evict)
+        self._audit_event(
+            "prefix_cache_blocks_evicted",
+            request_id=request_id,
+            donor_id=state.donor_id,
+            namespace=state.namespace,
+            phase=phase,
+            blocks_evicted=len(to_evict),
+            blocks_evicted_cumulative=len(state.evicted) + len(to_evict),
+            first_approx_block=int(state.first_approx_block),
+            block_table_blocks=sum(len(group) for group in state.block_ids),
+        )
+        if self._config.log_decisions and phase == "load_allocated":
+            # Only the first pass is a decision; the later ones are bookkeeping
+            # that repeats for the life of the request and belongs in the audit
+            # trail and the counter, not in the engine log.
+            logger.info(
+                "SemBlend evicted filled blocks from the prefix cache request_id=%s "
+                "donor_id=%s first_approx_block=%d blocks=%d",
+                request_id,
+                state.donor_id,
+                state.first_approx_block,
+                len(to_evict),
+            )
+        evicted = state.evicted | frozenset(to_evict)
+        head = state.block_ids[0] if state.block_ids else []
+        cursor = start
+        while cursor < len(head) and head[cursor] in evicted:
+            cursor += 1
+        return replace(state, evicted=evicted, scan_from=cursor)
+
     def update_state_after_alloc(
         self,
         request: "Request",
@@ -1368,6 +1550,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         num_external_tokens: int,
     ) -> None:
         request_id = self._request_id(request)
+        # Readmission after preemption re-hashes the whole prefix onto new
+        # physical blocks (num_computed_tokens is reset to 0, so the connector
+        # is re-queried from boundary 0), which makes anything tracked from the
+        # previous admission name blocks this request no longer owns. Drop it
+        # before deciding again and re-derive below: evicting on a stale table
+        # would knock unrelated traffic out of the prefix cache.
+        self._filled_blocks.pop(request_id, None)
         # The scheduler dropped the advertised span (e.g. a partial-tail loss):
         # the plan is stale and must not become a load.
         plan = self._load_plans.pop(request_id, None)
@@ -1412,6 +1601,23 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             tokens=int(plan["token_count"]),
             materialization_kind=plan["materialization_kind"].value,
             block_id_count=sum(len(group) for group in block_ids),
+        )
+        # allocate_slots has already hashed and cached the blocks it just
+        # allocated, this fill among them, so evict before the scheduler moves
+        # on to the next request: from here on the fill is only readable by the
+        # request it was served to. target_start is the token the fill begins
+        # at (None for a whole-request load, which starts at 0), and the
+        # startup gate guarantees a single KV-cache group, so the block index
+        # is unambiguous.
+        state = _FilledBlocks(
+            block_ids=block_ids,
+            first_approx_block=int(plan["target_start"] or 0) // self._block_size,
+            donor_id=str(plan["donor_id"]),
+            namespace=str(plan["namespace"]),
+            evicted=frozenset(),
+        )
+        self._filled_blocks[request_id] = self._evict_filled_blocks(
+            request_id, state, phase="load_allocated"
         )
 
     def _build_store_metadata(self, scheduler_output: "SchedulerOutput") -> list[PendingStore]:
@@ -1609,8 +1815,60 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 continue
             loads.append(load)
         stores = self._build_store_metadata(scheduler_output)
+        self._evict_running_fills(scheduler_output)
         self._pending_loads.clear()
         return SemBlendConnectorMetadata(loads=loads, stores=stores)
+
+    def _evict_running_fills(self, scheduler_output: "SchedulerOutput") -> None:
+        """Keep evicting as a served request fills more blocks.
+
+        A poisoned block's hash is the parent of every block hashed after it,
+        so the contaminated set grows with the request: the rest of the prompt
+        under chunked prefill, then every decode block. vLLM caches those in
+        the running loop, where the connector is never consulted, so this runs
+        once per step for as long as the request runs.
+
+        Only requests present in this step's diff are touched. A preempted
+        request is absent from it and its old block ids may already belong to
+        someone else; it re-derives through update_state_after_alloc when it is
+        readmitted.
+        """
+        if not self._filled_blocks:
+            return
+        for finished_id in getattr(scheduler_output, "finished_req_ids", None) or ():
+            self._filled_blocks.pop(str(finished_id), None)
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is None or not self._filled_blocks:
+            return
+        # For ids in resumed_req_ids the diff is the whole block table, not an
+        # addition to it (vLLM SchedulerOutput.CachedRequestData). Accumulating
+        # a replacement would leave this connector evicting blocks that now
+        # belong to other requests -- a self-inflicted prefix-cache regression
+        # on traffic it never served.
+        resumed = {str(req_id) for req_id in getattr(cached, "resumed_req_ids", None) or ()}
+        rows = zip(cached.req_ids, cached.new_block_ids, strict=True)
+        for req_id, new_block_ids in rows:
+            request_id = str(req_id)
+            state = self._filled_blocks.get(request_id)
+            if state is None:
+                continue
+            replace_table = request_id in resumed
+            block_ids = self._extend_block_table(
+                state.block_ids,
+                _normalize_block_ids(new_block_ids),
+                replace_table=replace_table,
+            )
+            next_state = replace(
+                state,
+                block_ids=block_ids,
+                # A replaced table names different physical blocks, so what was
+                # evicted from the old one says nothing about these.
+                evicted=frozenset() if replace_table else state.evicted,
+                scan_from=0 if replace_table else state.scan_from,
+            )
+            self._filled_blocks[request_id] = self._evict_filled_blocks(
+                request_id, next_state, phase="running_step"
+            )
 
     def _rope_params(self) -> tuple[float, int] | None:
         """(rope_theta, head_dim) from the model config; None when unknown.
@@ -2031,6 +2289,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._load_plans.pop(self._request_id(request), None)
         self._seen_requests.discard(self._request_id(request))
         self._capture_state.pop(self._request_id(request), None)
+        # The blocks are about to be freed and handed to other requests; the
+        # last step that cached any of them was evicted from build_connector_meta
+        # while the request was still running.
+        self._filled_blocks.pop(self._request_id(request), None)
         if self._compat_decline is not None:
             # A donor captured under a layout this connector cannot address is
             # a landmine for every later recipient that plans against it.

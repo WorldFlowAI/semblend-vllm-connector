@@ -100,8 +100,9 @@ class SemBlendVllmConfig:
     # servable request is served that way, the shared leading prompt is never
     # cached and the boundary stays 0 for good. Set to block_size so unserved
     # requests prime the shared prefix cleanly; it also keeps a boundary-
-    # alignment measurement from counting boundary-0 serves. Only parsed
-    # here; the match-hook gate that consumes it is wired separately.
+    # alignment measurement from counting boundary-0 serves. Enforced in
+    # the match hook, ahead of the provider lookup, so a declined request
+    # costs no embedding; it applies in every mode.
     min_boundary_tokens: int = 0
     min_similarity: float = 0.70
     min_reuse_ratio: float = 0.50
