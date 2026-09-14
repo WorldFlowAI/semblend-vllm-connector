@@ -5,7 +5,7 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
-## Unreleased
+## 0.2.4 - 2026-09-14
 
 Both entries are fixes for behaviour measured live in phase-0 E6
 (2026-09-14) on stock vLLM 0.29, where a prompt served from a donor was
