@@ -157,11 +157,23 @@ mix; replace its default coefficients with the numbers from your run.
 
 ## Prefix caching and served requests
 
+Run `semantic_span_experimental` with prefix caching ON
+(`--enable-prefix-caching`, vLLM's default). The mode depends on it: the
+scheduler consults the connector at the block-aligned end of the exact
+prefix hit, so the shared wrapper is what the exact cache holds and the
+document is what the connector supplies; with prefix caching off the
+boundary is pinned at zero and only whole-prompt matches can be served.
+
 A request that received a semantic load holds approximate KV for the
-served span. vLLM's prefix cache hashes blocks by token content, so with
-`--enable-prefix-caching` a later request whose token prefix matches a
-served request could receive the donor's KV through an exact-prefix hit.
-Until the connector marks served blocks as non-cacheable, run
-`semantic_span_experimental` with prefix caching disabled
-(`--no-enable-prefix-caching`), or isolate tenants with `cache_salt` so
-an exact-prefix hit can only come from the same tenant's own requests.
+served span, and vLLM's prefix cache hashes blocks by token content. The
+connector therefore evicts the blocks it filled from the engine's exact
+prefix cache on the step it fills them and on every later step the
+request is scheduled (`evict_filled_blocks_from_prefix_cache`, default
+true), so a later request whose token prefix matches a served request is
+consulted afresh rather than handed the donor's KV through an exact hit.
+This was measured live on vLLM 0.29 (2026-09-14): with the eviction off,
+verbatim repeats of a served prompt were served whole from the exact cache
+and the connector was never consulted; with it on, every repeat was
+re-consulted and re-served from the original donor. Leave the switch on
+outside a measurement of the contamination itself, and still isolate
+tenants with `cache_salt`.

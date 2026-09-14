@@ -5,7 +5,12 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
-## Unreleased
+## 0.2.5 - 2026-09-14
+
+The quickstart now says to run the semantic-span mode with prefix caching
+enabled: the eviction of connector-filled blocks was measured live in
+phase-0 E6 on vLLM 0.29 and removes the exact-cache contamination it was
+written for.
 
 Both entries come from the phase-0 LongBench-v2 pass of 2026-09-14 on stock
 vLLM 0.29: 232 requests, prompts with a median of 21.3K tokens, each document
