@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -25,12 +26,14 @@ from semblend_vllm_connector.semantic_span import (
     supply_at_boundary,
 )
 from semblend_vllm_connector.types import (
+    AuditJoinKey,
     DonorRegistration,
     MaterializationKind,
     PendingLoad,
     PendingStore,
     ReuseMode,
     SemanticLookupRequest,
+    SemanticLookupResult,
     SemBlendConnectorMetadata,
 )
 
@@ -48,6 +51,11 @@ logger = logging.getLogger("semblend_vllm_connector")
 # Per-donor length record the scheduler role reads from disk under both
 # storage backends; retracted on eviction so it never outlives the tensors.
 _DONOR_METADATA_FILENAME = "metadata.json"
+
+# Distinguishes connectors built in the same process (both roles in a
+# single-process engine, and every connector a test builds), so the per-request
+# sequence in an audit join key is attributable to the emitter that assigned it.
+_CONNECTOR_INSTANCE_SEQ = itertools.count(1)
 
 
 @dataclass(frozen=True)
@@ -209,10 +217,27 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # scheduling step; the semantic lookup (embedding + alignment) is
         # request-stable, so memoize it per request (cleared on finish).
         self._lookup_cache: dict[str, Any] = {}
-        # Requests that have reached the match hook at least once. The early
-        # exits above the lookup cannot use `first_lookup` (they return before
-        # anything is memoized), so this is what makes them per-request.
-        self._seen_requests: set[str] = set()
+        # Visits to the match hook, per request. The early exits above the
+        # lookup cannot use `first_lookup` (they return before anything is
+        # memoized), so this is what makes them per-request, and the index it
+        # holds is the `attempt` the per-attempt events are deduped by.
+        self._attempts: dict[str, int] = {}
+        # Fall-through reasons already audited, per request. The final
+        # fall-through is reachable on any attempt and for a different reason
+        # each time, so it is deduped on the reason rather than on the request.
+        self._no_safe_plan_reasons: dict[str, frozenset[str]] = {}
+        # B10 join key. `_request_seq` is stamped at first sight of a request
+        # and never re-derived, `_request_event_seq` is the next event slot
+        # within that request; both are retired only after the request's last
+        # event has been written (see request_finished).
+        self._connector_id = "{}-{}-{}".format(
+            getattr(role, "name", None) or str(role),
+            os.getpid(),
+            next(_CONNECTOR_INSTANCE_SEQ),
+        )
+        self._request_seq: dict[str, int] = {}
+        self._request_event_seq: dict[str, int] = {}
+        self._next_request_seq = 0
         # vLLM >= 0.26: the worker registers per-layer KV cache tensors
         # directly; layer objects no longer expose kv_cache. Load/save use
         # this dict when populated, falling back to the forward-context walk.
@@ -236,6 +261,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # per step, so a capture is a sequence of appends and each layer has
         # to know where its own copy ends (save_kv_layer is per layer).
         self._capture_progress: dict[str, dict[str, int]] = {}
+        # Request id -> the store end whose lost base was already audited. Every
+        # layer of one step loses the same base, so this is what keeps an
+        # 80-layer model from writing 80 identical rows for one restart while a
+        # later chunk that loses its base again still writes its own.
+        self._capture_base_missing_noted: dict[str, int] = {}
         # Destination blocks of loads declined on this worker after the
         # scheduler had already credited them; drained by vLLM each forward
         # so the engine recomputes them under kv_load_failure_policy.
@@ -258,7 +288,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # Counter scope convention. The phase-0 reuse metrics join these events
         # per request, so a counter with no scope suffix fires at most once per
         # request: sites below the lookup gate on `first_lookup`, sites above it
-        # on `_first_attempt_for`, and advertise sites on `first_advertise`. A
+        # on `_first_attempt_for`, and advertise sites on the request having had
+        # no plan at all (_record_load_plan, which counts a plan revised at a
+        # later boundary under its own per-attempt name instead). A
         # counter whose decision genuinely differs between scheduling attempts
         # of the same request (anything derived from num_computed_tokens) keeps
         # firing per attempt and carries a `_per_attempt` suffix, so a reader
@@ -464,13 +496,31 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
     def _prompt_text(self, request: Any) -> str | None:
         if not self._config.enable_prompt_text:
+            self._note_prompt_text_unavailable("disabled_by_config")
             return None
         for attr in ("prompt", "prompt_text", "text"):
             value = getattr(request, attr, None)
             if isinstance(value, str):
                 return value
         prompt_token_ids = getattr(request, "prompt_token_ids", None)
-        return self._decode_prompt_tokens(prompt_token_ids or self._token_ids(request))
+        text = self._decode_prompt_tokens(prompt_token_ids or self._token_ids(request))
+        if text is None:
+            self._note_prompt_text_unavailable("decode_unavailable")
+        return text
+
+    def _note_prompt_text_unavailable(self, reason: str) -> None:
+        """Record, once per reason, that lookups run without prompt text.
+
+        A provider that embeds the prompt has nothing to embed without it, so
+        every later miss is explained here rather than at the miss. The event
+        is emitted on the first occurrence only -- it would otherwise fire on
+        every lookup -- while the counter keeps the true count.
+        """
+        key = f"prompt_text_unavailable_{reason}"
+        first = not self._stats[key]
+        self._stats[key] += 1
+        if first:
+            self._audit_event("prompt_text_unavailable", reason=reason)
 
     def _decode_prompt_tokens(self, token_ids: Any) -> str | None:
         if not token_ids or self._prompt_tokenizer_failed:
@@ -513,27 +563,63 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
     def _request_id(self, request: Any) -> str:
         return str(getattr(request, "request_id", "unknown-request"))
 
-    def _first_attempt_for(self, request_id: str) -> bool:
-        """True only on this request's first visit to the match hook.
+    def _record_attempt(self, request_id: str) -> int:
+        """This request's 0-based visit count to the match hook.
 
         The hook is re-entered on every scheduling attempt while a request
         waits for admission. The early exits above the lookup return before
-        anything is memoized, so `first_lookup` cannot scope them; this can.
+        anything is memoized, so `first_lookup` cannot scope them; this can,
+        and every per-attempt audit event carries the index so the metrics
+        side can dedupe by request id without guessing.
         """
-        if request_id in self._seen_requests:
-            return False
-        self._seen_requests.add(request_id)
-        return True
+        attempt = self._attempts.get(request_id, 0)
+        self._attempts[request_id] = attempt + 1
+        return attempt
+
+    def _stamp_request_seq(self, request_id: str) -> int:
+        """This request's arrival number, assigned once and never re-derived."""
+        existing = self._request_seq.get(request_id)
+        if existing is not None:
+            return existing
+        self._next_request_seq += 1
+        self._request_seq[request_id] = self._next_request_seq
+        return self._next_request_seq
+
+    def _join_key(self, request_id: str) -> AuditJoinKey:
+        """Stamp this request's join identity and take its next event slot."""
+        return AuditJoinKey(
+            connector_id=self._connector_id,
+            request_id=request_id,
+            request_seq=self._stamp_request_seq(request_id),
+            event_seq=self._take_event_seq(request_id),
+        )
+
+    def _take_event_seq(self, request_id: str) -> int:
+        event_seq = self._request_event_seq.get(request_id, 0)
+        self._request_event_seq[request_id] = event_seq + 1
+        return event_seq
+
+    def _forget_request_join_key(self, request_id: str) -> None:
+        """Retire a finished request's join state, after its last event."""
+        self._request_seq.pop(request_id, None)
+        self._request_event_seq.pop(request_id, None)
 
     def _audit_event(self, event: str, **fields: Any) -> None:
         if not self._config.audit_path:
             return
+        # Every event that names a request carries the same join key, so the
+        # scorer never has to reconstruct a request's timeline from ordering
+        # or timestamps; engine-level events carry the emitter id alone.
+        request_id = fields.get("request_id")
+        join = None if request_id is None else self._join_key(str(request_id))
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "event": event,
             "source": "semblend_vllm_connector",
+            "connector_id": self._connector_id,
             "time_unix_s": time.time(),
             "mode": self._config.mode.value,
+            **({} if join is None else dict(join.as_fields())),
             **fields,
         }
         try:
@@ -944,6 +1030,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         token_count: int,
         materialization_kind: MaterializationKind,
         namespace: str,
+        boundary: int,
         donor_start: int | None = None,
         target_start: int | None = None,
     ) -> bool:
@@ -953,20 +1040,36 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         scheduler exits between it and the allocation hook, so nothing recorded
         here is visible to the worker until blocks actually exist.
 
-        Returns True only the first time a request records a plan: the
-        per-request reuse metrics join on the advertise event, so re-entering
-        the hook while a request waits for admission must not count again.
+        Returns True when the recorded plan is new or DIFFERENT, False for an
+        identical re-record. The per-request reuse metrics join the advertise
+        row to the allocate row, so re-entering the hook while a request waits
+        for admission must not advertise again -- but a request re-queried at
+        another boundary plans a different load, and leaving the old advertise
+        row beside the new allocate row joins a promise to a load it does not
+        describe. `boundary` is part of the plan's identity for that reason,
+        even where the rest of the plan happens to be unchanged.
         """
-        first_record = request_id not in self._load_plans
-        self._load_plans[request_id] = {
+        plan = {
             "donor_id": donor_id,
             "token_count": int(token_count),
             "materialization_kind": materialization_kind,
             "namespace": namespace,
+            "boundary": int(boundary),
             "donor_start": donor_start,
             "target_start": target_start,
         }
-        return first_record
+        previous = self._load_plans.get(request_id)
+        self._load_plans[request_id] = plan
+        if previous is None:
+            # Counted here rather than at the three call sites so the two units
+            # cannot drift apart: this one is the request's first advertise and
+            # stays a request count.
+            self._stats[f"{materialization_kind.value}_loads_advertised_total"] += 1
+        elif previous != plan:
+            # A revision is decided from num_computed_tokens, so it is a
+            # per-attempt fact and must not read as a request count.
+            self._stats["load_plan_revised_per_attempt"] += 1
+        return previous != plan
 
     def get_num_new_matched_tokens(
         self,
@@ -977,17 +1080,32 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         request_id = self._request_id(request)
         # Everything above the lookup is a request- or engine-stable decision,
         # so it is counted once per request rather than once per attempt.
-        first_attempt = self._first_attempt_for(request_id)
+        attempt = self._record_attempt(request_id)
+        first_attempt = attempt == 0
         if first_attempt:
             self._stats["lookups_total"] += 1
         if self._compat_decline is not None:
             if first_attempt:
                 self._stats["skipped_incompatible_engine_config"] += 1
+                self._audit_event(
+                    "lookup_skipped_incompatible_engine",
+                    request_id=request_id,
+                    attempt=attempt,
+                    prompt_tokens=len(token_ids),
+                    reason=self._compat_decline,
+                )
             return 0, False
 
         if not token_ids or len(token_ids) < self._config.min_prompt_tokens:
             if first_attempt:
                 self._stats["skipped_short_prompt"] += 1
+                self._audit_event(
+                    "lookup_skipped_short_prompt",
+                    request_id=request_id,
+                    attempt=attempt,
+                    prompt_tokens=len(token_ids),
+                    min_prompt_tokens=int(self._config.min_prompt_tokens),
+                )
             if self._config.log_decisions:
                 logger.info(
                     "SemBlend lookup skipped request_id=%s reason=short_prompt tokens=%d min=%d",
@@ -1003,6 +1121,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # num_computed_tokens, so a request can clear the threshold at one
             # boundary and not at the next, and gating would hide the skip.
             self._stats["skipped_exact_prefix_sufficient_per_attempt"] += 1
+            self._audit_event(
+                "lookup_skipped_exact_ratio",
+                request_id=request_id,
+                attempt=attempt,
+                boundary=int(num_computed_tokens),
+                prompt_tokens=len(token_ids),
+                exact_ratio=round(float(exact_ratio), 6),
+                threshold=float(self._config.skip_when_exact_prefix_ratio_at_least),
+            )
             if self._config.log_decisions:
                 logger.info(
                     "SemBlend lookup skipped request_id=%s reason=exact_prefix_sufficient "
@@ -1032,6 +1159,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             self._audit_event(
                 "lookup_skipped_below_min_boundary",
                 request_id=request_id,
+                attempt=attempt,
                 boundary=int(num_computed_tokens),
                 min_boundary_tokens=int(self._config.min_boundary_tokens),
                 block_size=self._block_size,
@@ -1050,6 +1178,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         if self._provider is None:
             if first_attempt:
                 self._stats["skipped_no_provider"] += 1
+                self._audit_event(
+                    "lookup_error",
+                    request_id=request_id,
+                    attempt=attempt,
+                    reason="no_provider",
+                    provider=self._config.provider,
+                )
             if self._config.log_decisions:
                 logger.info("SemBlend lookup skipped request_id=%s reason=no_provider", request_id)
             return 0, False
@@ -1076,11 +1211,24 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             started = time.monotonic()
             try:
                 result = self._provider.lookup(lookup)
-            except Exception:
+            except Exception as exc:
                 logger.exception(
                     "SemBlend provider lookup failed; falling back to normal prefill"
                 )
                 self._stats["provider_errors_total"] += 1
+                # Per attempt, not per request: nothing is memoized on the
+                # error path, so the next attempt re-runs the lookup and can
+                # fail again (or succeed). Only the exception type travels --
+                # a provider message can carry prompt content.
+                self._audit_event(
+                    "lookup_error",
+                    request_id=request_id,
+                    attempt=attempt,
+                    namespace=namespace,
+                    reason="provider_exception",
+                    provider=self._config.provider,
+                    error_type=type(exc).__name__,
+                )
                 return 0, False
             finally:
                 elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -1093,6 +1241,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 self._audit_event(
                     "semantic_lookup_miss",
                     request_id=request_id,
+                    attempt=attempt,
                     namespace=namespace,
                     latency_ms=elapsed_ms,
                 )
@@ -1110,6 +1259,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             self._audit_event(
                 "semantic_lookup_hit",
                 request_id=request_id,
+                attempt=attempt,
                 donor_id=result.donor_id,
                 namespace=namespace,
                 similarity=float(result.similarity),
@@ -1140,6 +1290,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 self._audit_event(
                     "materialization_suppressed_by_mode",
                     request_id=request_id,
+                    attempt=attempt,
                     donor_id=result.donor_id,
                     namespace=namespace,
                     materialization_kind=result.materialization_kind.value,
@@ -1166,6 +1317,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 self._audit_event(
                     "semantic_span_declined_unaligned_boundary",
                     request_id=request_id,
+                    attempt=attempt,
                     donor_id=result.donor_id,
                     namespace=namespace,
                     boundary=int(num_computed_tokens),
@@ -1178,11 +1330,18 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # to the captured window (no capture -> nothing servable).
             stored_tokens = self._stored_donor_token_count(result.donor_id, namespace)
             raw_spans = []
+            # Both drops are invisible in the outcome -- a span trimmed to
+            # nothing and a span that was never this donor's look identical at
+            # the return -- so they are counted for the miss payload.
+            segments_wrong_donor = 0
+            segments_beyond_capture = 0
             for seg in result.segments:
                 if seg.donor_id != result.donor_id:
+                    segments_wrong_donor += 1
                     continue
                 length = min(seg.token_count, stored_tokens - seg.donor_start)
                 if length <= 0:
+                    segments_beyond_capture += 1
                     continue
                 raw_spans.append(
                     {
@@ -1194,6 +1353,14 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             spans = block_align_spans(
                 raw_spans, self._block_size, self._config.min_semantic_span
             )
+            snapped_spans = [
+                {
+                    "target_start": span.target_start,
+                    "target_end": span.target_end,
+                    "donor_start": span.donor_start,
+                }
+                for span in spans
+            ]
             token_count, donor_start = supply_at_boundary(
                 spans, num_computed_tokens, self._block_size
             )
@@ -1216,6 +1383,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 self._audit_event(
                     "semantic_span_supply_clamped",
                     request_id=request_id,
+                    attempt=attempt,
                     donor_id=result.donor_id,
                     namespace=namespace,
                     boundary=int(num_computed_tokens),
@@ -1233,6 +1401,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 self._audit_event(
                     "semantic_span_declined_below_min_after_clamp",
                     request_id=request_id,
+                    attempt=attempt,
                     donor_id=result.donor_id,
                     namespace=namespace,
                     token_count=int(token_count),
@@ -1244,28 +1413,59 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 target_start = (
                     (num_computed_tokens + self._block_size - 1) // self._block_size
                 ) * self._block_size
-                first_advertise = self._record_load_plan(
+                plan_changed = self._record_load_plan(
                     request_id,
                     donor_id=result.donor_id,
                     token_count=token_count,
                     materialization_kind=MaterializationKind.SEMANTIC_SPAN,
                     namespace=namespace,
+                    boundary=num_computed_tokens,
                     donor_start=donor_start,
                     target_start=target_start,
                 )
-                if first_advertise:
-                    self._stats["semantic_span_loads_advertised_total"] += 1
+                if plan_changed:
                     self._audit_event(
                         "semantic_span_load_advertised",
                         request_id=request_id,
+                        attempt=attempt,
                         donor_id=result.donor_id,
                         namespace=namespace,
                         token_count=token_count,
                         donor_start=donor_start,
                         target_start=target_start,
                         boundary=int(num_computed_tokens),
+                        # The same span list the miss below carries, so an
+                        # alignment rate and its failure diagnosis are read off
+                        # one field rather than two shapes.
+                        snapped_spans=snapped_spans,
                     )
                 return token_count, False
+            # The boundary fell outside every span. Four causes land on this
+            # one return -- real misalignment, a donor not captured yet, a
+            # donor captured too short, and every span below the operator's
+            # floor -- and the outcome cannot tell them apart, so each one's
+            # evidence travels with the event. Attempt-scoped: the boundary
+            # moves, and a later attempt can land inside a span.
+            self._stats["semantic_span_boundary_missed_per_attempt"] += 1
+            self._audit_event(
+                "semantic_span_boundary_missed",
+                request_id=request_id,
+                attempt=attempt,
+                donor_id=result.donor_id,
+                namespace=namespace,
+                boundary=int(num_computed_tokens),
+                block_size=self._block_size,
+                min_semantic_span=int(self._config.min_semantic_span),
+                max_materialized_tokens=int(self._config.max_materialized_tokens),
+                stored_donor_tokens=int(stored_tokens),
+                n_segments=len(result.segments),
+                n_raw_segments=len(raw_spans),
+                segments_wrong_donor=segments_wrong_donor,
+                segments_beyond_capture=segments_beyond_capture,
+                raw_spans=raw_spans,
+                snapped_spans=snapped_spans,
+                prompt_tokens=len(token_ids),
+            )
             return 0, False
 
         if (
@@ -1286,18 +1486,19 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 max_candidate_tokens = min(max_candidate_tokens, common_prefix)
             token_count = _cacheable_prefix_tokens(max_candidate_tokens, self._block_size)
             if token_count > 0:
-                first_advertise = self._record_load_plan(
+                plan_changed = self._record_load_plan(
                     request_id,
                     donor_id=result.donor_id,
                     token_count=token_count,
                     materialization_kind=MaterializationKind.REQUEST_ONLY,
                     namespace=namespace,
+                    boundary=num_computed_tokens,
                 )
-                if first_advertise:
-                    self._stats["request_only_loads_advertised_total"] += 1
+                if plan_changed:
                     self._audit_event(
                         "request_only_load_advertised",
                         request_id=request_id,
+                        attempt=attempt,
                         donor_id=result.donor_id,
                         namespace=namespace,
                         tokens=int(token_count),
@@ -1327,18 +1528,36 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 self._audit_event(
                     "request_only_load_rejected",
                     request_id=request_id,
+                    attempt=attempt,
                     donor_id=result.donor_id,
                     namespace=namespace,
                     common_prefix_tokens=int(common_prefix),
                     candidate_tokens=int(max_candidate_tokens),
                     reason="non_identical_prefix",
                 )
+            # Terminal: this request_only hit was passed over for a reason that
+            # is already on the record. Falling through instead would reach the
+            # no-safe-plan exit and label the same request with a second,
+            # weaker reason derived from the mode.
+            return 0, False
 
         if result.materialization_kind == MaterializationKind.DISCOVERY_ONLY:
             # Twin of the DISCOVERY_ONLY-mode site above: the kind comes from
-            # the memoized lookup, so it is one fact about the request.
+            # the memoized lookup, so it is one fact about the request. The hit
+            # is real and the supply is nothing, which is a different row from
+            # a miss and from a mode that suppressed a materializable hit.
             if first_lookup:
                 self._stats["discovery_only_hits_total"] += 1
+                self._audit_event(
+                    "discovery_only_no_supply",
+                    request_id=request_id,
+                    attempt=attempt,
+                    donor_id=result.donor_id,
+                    namespace=namespace,
+                    similarity=float(result.similarity),
+                    reusable_tokens=int(result.reusable_token_count),
+                    reason=result.reason,
+                )
             return 0, False
 
         if (
@@ -1381,6 +1600,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 self._audit_event(
                     "exact_prefix_load_declined",
                     request_id=request_id,
+                    attempt=attempt,
                     donor_id=result.donor_id,
                     namespace=namespace,
                     reusable_tokens=int(result.reusable_token_count),
@@ -1389,12 +1609,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     reason="below_one_block_after_clamp",
                 )
                 return 0, False
-            first_advertise = self._record_load_plan(
+            plan_changed = self._record_load_plan(
                 request_id,
                 donor_id=result.donor_id,
                 token_count=token_count,
                 materialization_kind=result.materialization_kind,
                 namespace=namespace,
+                boundary=num_computed_tokens,
                 # Both frames travel with the plan. Without them the worker
                 # writes [0, token_count) from donor token 0, which overwrites
                 # the reference-counted blocks vLLM's own prefix cache handed
@@ -1402,11 +1623,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 donor_start=num_computed_tokens,
                 target_start=num_computed_tokens,
             )
-            if first_advertise:
-                self._stats["exact_prefix_loads_advertised_total"] += 1
+            if plan_changed:
                 self._audit_event(
                     "exact_prefix_load_advertised",
                     request_id=request_id,
+                    attempt=attempt,
                     donor_id=result.donor_id,
                     namespace=namespace,
                     tokens=int(token_count),
@@ -1418,18 +1639,60 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 )
             return token_count, False
 
-        # Reached from the memoized lookup result and the configured mode, both
-        # request-stable, so count and audit the fall-through once.
-        if first_lookup:
-            self._stats["materialization_rejected_no_safe_plan"] += 1
+        # Not all of what lands here is request-stable: a mode's branch is
+        # entered from facts that move with the boundary, so the same request
+        # can fall through for one reason now and another later. Gating on
+        # first_lookup left every later fall-through with no row at all, so the
+        # dedupe is per (request, reason).
+        reason = self._no_safe_plan_reason(result, namespace, num_computed_tokens)
+        recorded = self._no_safe_plan_reasons.get(request_id, frozenset())
+        if reason not in recorded:
+            self._no_safe_plan_reasons[request_id] = recorded | {reason}
+            if not recorded:
+                self._stats["materialization_rejected_no_safe_plan"] += 1
+            self._stats[f"materialization_rejected_no_safe_plan_{reason}"] += 1
             self._audit_event(
                 "materialization_rejected_no_safe_plan",
                 request_id=request_id,
+                attempt=attempt,
                 donor_id=result.donor_id,
                 namespace=namespace,
                 materialization_kind=result.materialization_kind.value,
+                reason=reason,
+                boundary=int(num_computed_tokens),
             )
         return 0, False
+
+    def _no_safe_plan_reason(
+        self, result: SemanticLookupResult, namespace: str, num_computed_tokens: int
+    ) -> str:
+        """Why this mode's materialization branch did not take a real hit.
+
+        The mode alone cannot answer it: a request_only hit is passed over for
+        a donor that was never captured, for a mid-prompt boundary and for a
+        donor with no token ids, and those are three different fixes. Each
+        branch below walks its mode's entry condition in the order the
+        condition short-circuits, so the reason names the first test that
+        failed rather than the last one a reader would guess.
+        """
+        mode = self._config.mode
+        if mode == ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL:
+            # Segments are the only gate on that branch and every path inside
+            # it returns, so reaching here means the planner returned none.
+            return "no_segments"
+        if mode == ReuseMode.REQUEST_ONLY_EXPERIMENTAL:
+            if not result.donor_token_ids:
+                return "no_donor_token_ids"
+            if not self._has_stored_donor(result.donor_id, namespace):
+                return "donor_not_stored"
+            return "boundary_not_zero"
+        if mode == ReuseMode.EXACT_PREFIX:
+            if result.materialization_kind != MaterializationKind.EXACT_PREFIX:
+                return "mode_kind_mismatch"
+            if not result.block_refs:
+                return "no_block_refs"
+            return "no_reusable_tokens"
+        return "mode_kind_mismatch"
 
     def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
         """Keep the scheduler's block pool so filled blocks can be evicted.
@@ -1561,9 +1824,31 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # the plan is stale and must not become a load.
         plan = self._load_plans.pop(request_id, None)
         if num_external_tokens <= 0:
+            if plan is not None:
+                # Advertised, then not credited: the scheduler dropped the span
+                # (a partial-tail loss, or the request was not admitted with it).
+                # Without this row the advertise has no allocate to join to and
+                # M2 keeps a numerator term for a load that never existed.
+                self._stats["load_dropped_before_alloc"] += 1
+                self._audit_event(
+                    "load_dropped_before_alloc",
+                    request_id=request_id,
+                    donor_id=plan["donor_id"],
+                    namespace=plan["namespace"],
+                    tokens=int(plan["token_count"]),
+                    materialization_kind=plan["materialization_kind"].value,
+                    num_external_tokens=int(num_external_tokens),
+                )
             return
         if plan is None:
+            # The scheduler credited external tokens this connector never
+            # advertised (or advertised under an id it has since forgotten).
             self._stats["alloc_without_pending_load"] += 1
+            self._audit_event(
+                "alloc_without_pending_load",
+                request_id=request_id,
+                num_external_tokens=int(num_external_tokens),
+            )
             return
         get_block_ids = getattr(blocks, "get_block_ids", None)
         block_ids = get_block_ids(allow_none=True) if callable(get_block_ids) else None
@@ -1620,8 +1905,35 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             request_id, state, phase="load_allocated"
         )
 
+    def _note_capture_disabled(self) -> None:
+        """Record, once, that no request on this worker can become a donor.
+
+        This is decided per scheduling step, so only the first one is written;
+        the counter keeps the true count. Without the row, a run with an empty
+        donor pool is indistinguishable from one whose lookups all missed.
+        """
+        first = not self._stats["capture_disabled_steps"]
+        self._stats["capture_disabled_steps"] += 1
+        if first:
+            self._audit_event(
+                "capture_disabled",
+                compat_declined_reason=self._compat_decline,
+            )
+
+    def _note_capture_skipped(self, request_id: str, reason: str, **fields: Any) -> None:
+        """One row per request that will not be captured, with its reason.
+
+        M2's supply side is the donor pool: a request skipped here is a donor
+        no later recipient could match, and the reasons need different fixes.
+        """
+        self._stats[f"capture_skipped_{reason}"] += 1
+        self._audit_event(
+            "capture_skipped", request_id=request_id, reason=reason, **fields
+        )
+
     def _build_store_metadata(self, scheduler_output: "SchedulerOutput") -> list[PendingStore]:
         if not self._materialization_enabled():
+            self._note_capture_disabled()
             return []
         for finished_id in getattr(scheduler_output, "finished_req_ids", None) or ():
             self._capture_state.pop(str(finished_id), None)
@@ -1637,18 +1949,35 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         """Open a capture for each request scheduled for the first time."""
         stores: list[PendingStore] = []
         for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
-            token_ids = self._token_ids(new_req)
-            if len(token_ids) < self._config.min_prompt_tokens:
-                continue
+            # Resolved before the length gate so every skip below can name the
+            # request it dropped.
             request_id = str(
                 getattr(new_req, "req_id", None)
                 or getattr(new_req, "request_id", None)
                 or "unknown-request"
             )
+            token_ids = self._token_ids(new_req)
+            if len(token_ids) < self._config.min_prompt_tokens:
+                self._note_capture_skipped(
+                    request_id,
+                    "short_prompt",
+                    prompt_tokens=len(token_ids),
+                    min_prompt_tokens=int(self._config.min_prompt_tokens),
+                )
+                continue
             if not self._capture_allowed(request_id):
+                self._note_capture_skipped(
+                    request_id,
+                    "served_request",
+                    phase="admitted",
+                    prompt_tokens=len(token_ids),
+                )
                 continue
             block_ids = _normalize_block_ids(getattr(new_req, "block_ids", None))
             if block_ids is None:
+                self._note_capture_skipped(
+                    request_id, "no_block_ids", prompt_tokens=len(token_ids)
+                )
                 continue
             state = _CaptureState(
                 token_ids=token_ids,
@@ -1694,13 +2023,28 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             if state is None:
                 continue
             if not self._capture_allowed(request_id):
+                self._note_capture_skipped(
+                    request_id,
+                    "served_request",
+                    phase="continuation",
+                    captured_end=int(state.captured_end),
+                )
                 self._capture_state.pop(request_id, None)
                 continue
             if int(num_output_tokens or 0) > 0:
                 # Decode: the prompt is fully computed, so a capture still
                 # open here is short of its cap for good (the block table
                 # never covered it); close it so the entry does not linger.
+                # It is still a donor, just a shorter one than advertised, so
+                # it gets its own name rather than a skip.
                 self._stats["capture_closed_short_at_decode"] += 1
+                self._audit_event(
+                    "capture_closed_short",
+                    request_id=request_id,
+                    reason="decode_started",
+                    captured_end=int(state.captured_end),
+                    prompt_tokens=len(state.token_ids),
+                )
                 self._capture_state.pop(request_id, None)
                 continue
             block_ids = self._extend_block_table(
@@ -1727,10 +2071,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         if request_id not in self._served_request_ids:
             return True
         self._served_request_ids.discard(request_id)
-        if self._config.capture_served_requests:
-            return True
-        self._stats["capture_skipped_served"] += 1
-        return False
+        # The skip's counter and audit row are the caller's (it knows which
+        # capture phase this is); one skip must not land on two keys.
+        return bool(self._config.capture_served_requests)
 
     def _computed_end(
         self,
@@ -1744,7 +2087,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # Stock vLLM always carries num_scheduled_tokens; only a stub
             # engine omits it. Assume the whole prompt, and keep the
             # unclamped capture visible in the stats.
+            first = not self._stats["capture_unclamped_no_schedule_info"]
             self._stats["capture_unclamped_no_schedule_info"] += 1
+            if first:
+                # Once per connector: the condition is a property of the engine
+                # stub, not of a request, and it holds for every step it runs.
+                self._audit_event("capture_unclamped_no_schedule_info")
             return prompt_tokens
         return num_computed_tokens + int(scheduled_tokens.get(request_id, 0) or 0)
 
@@ -1777,6 +2125,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         prompt_cap = _cacheable_prefix_tokens(len(state.token_ids), self._block_size)
         if prompt_cap <= 0:
             self._capture_state.pop(request_id, None)
+            self._note_capture_skipped(
+                request_id,
+                "prompt_below_one_block",
+                prompt_tokens=len(state.token_ids),
+                block_size=self._block_size,
+            )
             return None
         end = min(
             prompt_cap,
@@ -1926,24 +2280,33 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         Returns None (declining the layer) for MLA layouts or when rope
         parameters are unavailable; callers fall back to normal compute.
         """
+        return self._semantic_span_slice_with_reason(src_kv_cache, load, attn_metadata)[0]
+
+    def _semantic_span_slice_with_reason(self, src_kv_cache, load, attn_metadata):
+        """The slice above, plus why it declined, for the load's audit row.
+
+        The decline is per layer but its cause is per load, so the caller
+        aggregates the reasons into one event instead of writing one row per
+        layer of every declined load.
+        """
         import torch
 
         from semblend_vllm_connector.semantic_span import rerotate_k
 
         if self._is_mla_metadata(attn_metadata):
             self._stats["semantic_span_declined_mla"] += 1
-            return None
+            return None, "mla_layout"
         params = self._rope_params()
         if params is None or load.donor_start is None or load.target_start is None:
             self._stats["semantic_span_declined_no_rope_params"] += 1
-            return None
+            return None, "no_rope_params"
         theta, head_dim = params
         window = src_kv_cache[
             :, load.donor_start : load.donor_start + load.token_count, ...
         ]
         if window.shape[1] < load.token_count:
             self._stats["semantic_span_declined_short_donor"] += 1
-            return None
+            return None, "short_donor"
         # Stored KV is [2, n, H*D] (flattened); rotation operates per head.
         n_tok = window.shape[1]
         k_heads = window[0].reshape(n_tok, -1, head_dim)
@@ -1954,7 +2317,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             head_dim=head_dim,
             rope_theta=theta,
         ).reshape(n_tok, -1)
-        return torch.stack((k, window[1]))
+        return torch.stack((k, window[1])), None
 
     def register_kv_caches(self, kv_caches: dict) -> None:
         self._registered_kv_caches = dict(kv_caches)
@@ -1977,7 +2340,19 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
-        if not isinstance(metadata, SemBlendConnectorMetadata) or not metadata.loads:
+        if not isinstance(metadata, SemBlendConnectorMetadata):
+            # Another connector's metadata reached this worker (a MultiConnector
+            # misconfiguration). Every load the scheduler credited is silently
+            # dropped, so the shape is named once rather than not at all.
+            first = not self._stats["load_metadata_unexpected_type_steps"]
+            self._stats["load_metadata_unexpected_type_steps"] += 1
+            if first:
+                self._audit_event(
+                    "load_metadata_unexpected_type",
+                    metadata_type=type(metadata).__name__,
+                )
+            return
+        if not metadata.loads:
             return
 
         from safetensors.torch import load_file
@@ -1990,7 +2365,16 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # span as computed, so the load must happen now; attn_metadata is
             # only consulted for the MLA layout check, which stays as last seen.
             attn_metadata = self._last_attn_metadata
+            first = not self._stats["materialized_without_forward"]
             self._stats["materialized_without_forward"] += 1
+            if first:
+                # Once per connector: the layout check falls back to the last
+                # seen metadata on every no-forward step, so a per-step row
+                # would bury the trail while saying the same thing.
+                self._audit_event(
+                    "materialized_without_forward",
+                    have_last_attn_metadata=attn_metadata is not None,
+                )
         else:
             self._last_attn_metadata = attn_metadata
 
@@ -2013,6 +2397,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     load.token_count,
                 )
             layers_materialized = 0
+            layers_without_attn_metadata = 0
+            # Per-layer declines with a per-load cause; aggregated so the load
+            # gets one row instead of one per layer.
+            span_declines: Counter[str] = Counter()
             donor_gone = False
             # The donor capture is indexed by absolute token position, so a
             # load whose destination starts past 0 has to read from the same
@@ -2032,6 +2420,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     # layer). The MLA check below then answers "not MLA" by
                     # default, so keep the gap visible rather than silent.
                     self._stats["layer_attn_metadata_missing"] += 1
+                    layers_without_attn_metadata += 1
                 if entry is not None and layer_name in entry:
                     src_kv_cache = entry[layer_name].to(dst_kv_cache_layer.device)
                 else:
@@ -2046,10 +2435,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                         break
                     src_kv_cache = tensors["kv_cache"].to(dst_kv_cache_layer.device)
                 if load.materialization_kind == MaterializationKind.SEMANTIC_SPAN:
-                    src_kv_cache = self._semantic_span_slice(
+                    src_kv_cache, decline_reason = self._semantic_span_slice_with_reason(
                         src_kv_cache, load, layer_metadata
                     )
                     if src_kv_cache is None:
+                        span_declines[decline_reason or "unknown"] += 1
                         continue
                 elif self._is_mla_metadata(layer_metadata):
                     src_kv_cache = src_kv_cache[
@@ -2072,6 +2462,20 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     layer_metadata,
                 )
                 layers_materialized += 1
+            if span_declines:
+                # The loud raise below reports only that zero layers landed;
+                # this says which gate declined them and how many, which is the
+                # difference between an MLA model, a missing rope config and a
+                # donor shorter than the span the scheduler already credited.
+                self._audit_event(
+                    "semantic_span_layers_declined",
+                    request_id=load.request_id,
+                    donor_id=load.donor_id,
+                    namespace=load.namespace,
+                    layers_declined=sum(span_declines.values()),
+                    layers_materialized=layers_materialized,
+                    reasons=dict(span_declines),
+                )
             if donor_gone:
                 self._stats["load_declined_donor_gone"] += 1
                 self._audit_event(
@@ -2083,6 +2487,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     materialization_kind=load.materialization_kind.value,
                     declined_reason="donor_gone",
                     layers_materialized=layers_materialized,
+                    layers_without_attn_metadata=layers_without_attn_metadata,
                 )
             if load.materialization_kind == MaterializationKind.SEMANTIC_SPAN and (
                 donor_gone or layers_materialized <= 0
@@ -2131,6 +2536,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     tokens=int(load.token_count),
                     materialization_kind=load.materialization_kind.value,
                     declined_reason="no_kv_layers_materialized",
+                    layers_without_attn_metadata=layers_without_attn_metadata,
                 )
                 continue
             self._stats["loads_materialized_total"] += 1
@@ -2142,6 +2548,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 tokens=int(load.token_count),
                 materialization_kind=load.materialization_kind.value,
                 layers_materialized=layers_materialized,
+                layers_without_attn_metadata=layers_without_attn_metadata,
             )
             if self._config.log_decisions:
                 logger.info(
@@ -2156,11 +2563,31 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
     def save_kv_layer(self, layer_name: str, kv_layer: Any, attn_metadata: Any, **kwargs: Any) -> None:
         metadata = self._get_connector_metadata()
-        if not isinstance(metadata, SemBlendConnectorMetadata) or not metadata.stores:
+        if not isinstance(metadata, SemBlendConnectorMetadata):
+            # Mirror of start_load_kv: another connector's metadata reached this
+            # worker (a MultiConnector misconfiguration) and every capture the
+            # scheduler queued is dropped, so the shape is named once rather
+            # than not at all. An empty store list is normal progress (a step
+            # with nothing to capture) and stays silent.
+            first = not self._stats["capture_metadata_unexpected_type_layers"]
+            self._stats["capture_metadata_unexpected_type_layers"] += 1
+            if first:
+                self._audit_event(
+                    "capture_metadata_unexpected_type",
+                    metadata_type=type(metadata).__name__,
+                )
+            return
+        if not metadata.stores:
             return
 
         for store in metadata.stores:
             if store.block_ids is None:
+                self._note_capture_skipped(
+                    store.request_id,
+                    "store_without_block_ids",
+                    layer_name=layer_name,
+                    token_count=int(store.token_count),
+                )
                 continue
             self._capture_layer(store, layer_name, kv_layer, attn_metadata)
 
@@ -2187,6 +2614,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         base = self._captured_layer(store, layer_name) if start > 0 else None
         if start > 0 and base is None:
             self._stats["layer_capture_base_missing"] += 1
+            self._note_capture_base_missing(store, layer_name, start)
             start = 0
         slot_mapping = self._slot_mapping(
             store.block_ids, store.token_count - start, kv_layer.device, target_start=start
@@ -2199,6 +2627,28 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         actual_token_count = start + int(slot_mapping.numel())
         self._write_captured_layer(store, layer_name, host_kv, actual_token_count)
         self._capture_progress[store.request_id] = {**progress, layer_name: actual_token_count}
+
+    def _note_capture_base_missing(
+        self, store: PendingStore, layer_name: str, start: int
+    ) -> None:
+        """Record, once per store, that a chunked capture restarted from zero.
+
+        The earlier chunks this layer appended to are gone (evicted donor,
+        retracted storage), so the tokens already copied are discarded and the
+        window is re-read from 0. It is silent in the outcome -- the donor is
+        still written and still advertises a length -- yet a donor that keeps
+        landing here is paying for the same prefix on every chunk.
+        """
+        if self._capture_base_missing_noted.get(store.request_id) == int(store.token_count):
+            return
+        self._capture_base_missing_noted[store.request_id] = int(store.token_count)
+        self._audit_event(
+            "capture_base_missing",
+            request_id=store.request_id,
+            layer=layer_name,
+            discarded_start=int(start),
+            token_count=int(store.token_count),
+        )
 
     def _captured_layer(self, store: PendingStore, layer_name: str) -> Any | None:
         """This donor's stored copy of one layer, or None when there is none."""
@@ -2252,7 +2702,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         """
         storage_key, entry = self._memory_store.popitem(last=False)
         self._stats["memory_store_evictions"] += 1
-        self._capture_progress.pop(str(entry.get("__request_id__", "")), None)
+        evicted_request_id = str(entry.get("__request_id__", ""))
+        self._capture_progress.pop(evicted_request_id, None)
+        # The next chunk of an evicted donor finds no base by construction, and
+        # that restart is its own event: forget that this request was already
+        # reported so the eviction's consequence is not deduped away.
+        self._capture_base_missing_noted.pop(evicted_request_id, None)
         donor_dir = self._donor_dir_for_key(storage_key)
         try:
             os.remove(os.path.join(donor_dir, _DONOR_METADATA_FILENAME))
@@ -2276,34 +2731,104 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
     ) -> tuple[set[str] | None, set[str] | None]:
         # Worker side. A finished request sends no more prefill chunks, so
         # its capture progress can go; the captured donor itself stays.
+        #
+        # This is also the worker's only finish hook: request_finished is
+        # scheduler-role, so without retiring the join key here the worker's
+        # per-request maps grow for the life of the process. The worker emits
+        # no event for a finished request, so the key is retired with it.
         for request_id in finished_req_ids or ():
             self._capture_progress.pop(str(request_id), None)
+            self._capture_base_missing_noted.pop(str(request_id), None)
+            self._forget_request_join_key(str(request_id))
         return None, None
+
+    def on_new_request(self, request: "Request") -> None:
+        """Stamp the join key at the engine's own first sight of the request.
+
+        vLLM calls this once, when the request is added to the scheduler,
+        strictly before the first match-hook attempt, so the sequence it
+        assigns is an arrival order rather than a scheduling order. It also
+        gives every request a denominator row even when it leaves the match
+        hook by an exit that decides nothing. An engine that does not call it
+        loses only that: the first audited event stamps the key instead.
+        """
+        request_id = self._request_id(request)
+        self._audit_event(
+            "request_first_seen",
+            request_id=request_id,
+            prompt_tokens=len(self._token_ids(request)),
+        )
 
     def request_finished(
         self,
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        self._lookup_cache.pop(self._request_id(request), None)
-        self._load_plans.pop(self._request_id(request), None)
-        self._seen_requests.discard(self._request_id(request))
-        self._capture_state.pop(self._request_id(request), None)
+        request_id = self._request_id(request)
+        self._lookup_cache.pop(request_id, None)
+        self._load_plans.pop(request_id, None)
+        self._attempts.pop(request_id, None)
+        self._no_safe_plan_reasons.pop(request_id, None)
+        self._capture_state.pop(request_id, None)
         # The blocks are about to be freed and handed to other requests; the
         # last step that cached any of them was evicted from build_connector_meta
         # while the request was still running.
-        self._filled_blocks.pop(self._request_id(request), None)
+        self._filled_blocks.pop(request_id, None)
+        try:
+            self._register_donor_on_finish(request, request_id, block_ids)
+        finally:
+            # Last, so the join key outlives every event this finish emits.
+            self._forget_request_join_key(request_id)
+        return False, None
+
+    def _register_donor_on_finish(
+        self, request: "Request", request_id: str, block_ids: list[int]
+    ) -> None:
+        """Offer the finished request to the donor pool, or say why not.
+
+        Every exit here is the `finish` leg of the phase-0 join, so a request
+        that never becomes a donor still leaves a row naming the reason.
+        """
         if self._compat_decline is not None:
             # A donor captured under a layout this connector cannot address is
             # a landmine for every later recipient that plans against it.
             self._stats["donor_registration_skipped_incompatible"] += 1
-            return False, None
-        if not self._config.register_donors or self._provider is None:
-            return False, None
+            self._audit_event(
+                "donor_registration_skipped",
+                request_id=request_id,
+                reason="incompatible_engine",
+                detail=self._compat_decline,
+            )
+            return
+        if not self._config.register_donors:
+            self._stats["donor_registration_skipped_disabled"] += 1
+            self._audit_event(
+                "donor_registration_skipped",
+                request_id=request_id,
+                reason="register_donors_disabled",
+            )
+            return
+        if self._provider is None:
+            self._stats["donor_registration_skipped_no_provider"] += 1
+            self._audit_event(
+                "donor_registration_skipped",
+                request_id=request_id,
+                reason="no_provider",
+                detail=self._config.provider,
+            )
+            return
 
         token_ids = self._token_ids(request)
         if len(token_ids) < self._config.min_prompt_tokens:
-            return False, None
+            self._stats["donor_registration_skipped_short_prompt"] += 1
+            self._audit_event(
+                "donor_registration_skipped",
+                request_id=request_id,
+                reason="short_prompt",
+                prompt_tokens=len(token_ids),
+                min_prompt_tokens=int(self._config.min_prompt_tokens),
+            )
+            return
 
         try:
             donor = DonorRegistration(
@@ -2335,10 +2860,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     len(token_ids),
                     len(block_ids),
                 )
-        except Exception:
+        except Exception as exc:
             logger.exception("SemBlend donor registration failed")
             self._stats["donor_registration_errors_total"] += 1
-        return False, None
+            # Type only: a provider message can carry prompt content.
+            self._audit_event(
+                "donor_registration_failed",
+                request_id=request_id,
+                error_type=type(exc).__name__,
+            )
 
     def take_events(self):
         return ()

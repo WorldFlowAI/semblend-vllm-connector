@@ -29,6 +29,34 @@ class MaterializationKind(str, Enum):
 
 
 @dataclass(frozen=True)
+class AuditJoinKey:
+    """The identity every audit event for one request carries.
+
+    Phase-0 joins advertise -> allocate -> materialize -> finish by equality on
+    ``request_id`` alone, so nothing here may be re-derived from state that
+    moves between scheduling attempts. ``request_seq`` is stamped once, at the
+    connector's first sight of the request, which makes it an arrival order
+    rather than a scheduling order; ``event_seq`` orders the events within one
+    request. Both are numbered per connector instance, which is what
+    ``connector_id`` disambiguates: the scheduler and worker roles append to
+    the same audit file and number the same request independently.
+    """
+
+    connector_id: str
+    request_id: str
+    request_seq: int
+    event_seq: int
+
+    def as_fields(self) -> Mapping[str, Any]:
+        return {
+            "connector_id": self.connector_id,
+            "request_id": self.request_id,
+            "request_seq": self.request_seq,
+            "event_seq": self.event_seq,
+        }
+
+
+@dataclass(frozen=True)
 class SemanticBlockRef:
     block_id: str
     start_token: int

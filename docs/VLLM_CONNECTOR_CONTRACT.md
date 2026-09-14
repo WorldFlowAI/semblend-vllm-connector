@@ -78,7 +78,7 @@ Only backend-confirmed materialization should count as confirmed KV reuse.
 ## Audit Contract
 
 When `audit_path` / `SEMBLEND_VLLM_AUDIT_PATH` is set, the connector emits
-JSONL events with `schema_version=1`.
+JSONL events with `schema_version=2`.
 
 Benchmark and product gates should treat:
 
@@ -91,3 +91,21 @@ Benchmark and product gates should treat:
 Do not count semantic hits or advertised loads as materialized KV reuse unless a
 matching `runtime_materialized` event exists and negative controls remain at
 zero.
+
+### Join Key
+
+Every event that names a request carries four join fields:
+
+| Field | Meaning |
+| --- | --- |
+| `connector_id` | The emitting connector instance. Both roles append to the same file and number requests independently. |
+| `request_id` | The vLLM request id. |
+| `request_seq` | The request's arrival number within that connector instance, stamped at first sight and never re-derived. vLLM reuses request ids, so `request_id` alone does not separate two uses of one id. |
+| `event_seq` | The event's position within that request, so events written in the same second can still be ordered. |
+
+`request_seq` and `event_seq` are per connector instance, so a cross-role join
+(a scheduler advertise against a worker materialization) is on `request_id`
+alone; within one role, join on `connector_id` plus `request_seq`.
+
+An event that names no request (`connector_initialized`, and the once-per-
+connector shape warnings) carries `connector_id` only.
