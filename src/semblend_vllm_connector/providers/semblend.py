@@ -127,6 +127,16 @@ class SemBlendPipelineProvider:
         )
 
     def register_donor(self, donor: DonorRegistration) -> None:
+        """Register a completed request as a donor.
+
+        Two different keys travel with it. ``extra_key`` is the connector's
+        per-request namespace, which isolates the donor inside this engine.
+        ``cache_salt`` is the request's raw salt, from which SemBlend derives
+        the tenant key it publishes: the namespace digests engine-private
+        inputs and no router can reproduce it, so without the salt the donor
+        is announced with no tenant identity anyone can match. Neither value
+        is logged.
+        """
         kwargs = {
             "request_id": donor.donor_id,
             "token_ids": list(donor.token_ids),
@@ -140,6 +150,10 @@ class SemBlendPipelineProvider:
             kwargs["tenant"] = str(tenant)
         if template and "template" in params:
             kwargs["template"] = str(template)
+        # Older SemBlend releases have no tenant-key argument; passing it
+        # would raise rather than degrade, and the donor would be lost.
+        if "cache_salt" in params:
+            kwargs["cache_salt"] = donor.cache_salt
         self._pipeline.register_donor(**kwargs)
 
     def clear_donors(self) -> None:

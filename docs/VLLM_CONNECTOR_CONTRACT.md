@@ -166,3 +166,57 @@ alone; within one role, join on `connector_id` plus `request_seq`.
 
 An event that names no request (`connector_initialized`, and the once-per-
 connector shape warnings) carries `connector_id` only.
+
+## Tenant key
+
+Two different keys travel with every request, and they are not
+interchangeable.
+
+**The namespace** (`namespace_for_request`) is engine-local. It digests the
+model, tokenizer, block size, dtype, `cache_salt` and adapter, so it moves with
+values that are not request fields at all. It is what isolates a donor inside
+this engine: a lookup sees donors registered under the identical namespace and
+nothing else. Nothing outside this process can reproduce it, by design.
+
+**The tenant key** is derived from the request's raw `cache_salt` alone:
+
+```
+tenant_key := "semblend:tenant:v1:" + sha256(cache_salt utf-8)[:32]
+```
+
+with the sentinel `semblend:tenant:v1:none` when the request carries no salt.
+Because it is a function of the salt and nothing else, a gateway that sets one
+salt per tenant can compute the same string, which is what makes tenant-scoped
+placement possible; because it is a digest, the salt itself never reaches the
+wire or anyone's logs.
+
+The connector does not compute the tenant key. It reads the raw salt
+(`cache_salt_for_request`) and carries it on the records it hands the provider
+— `SemanticLookupRequest.cache_salt` and `DonorRegistration.cache_salt` — so a
+provider never reaches back into vLLM's objects for it. The SemBlend provider
+forwards it to `SemBlendPipeline.register_donor(cache_salt=...)`, and SemBlend
+publishes it in the `DonorRegistered` event at
+`namespace.extra.tenant_key`, beside the engine-local key at
+`namespace.extra.cache_salt`.
+
+The contract is SemBlend's, versioned **tenant key v1**, and is written down
+once in `semblend-release/docs/tenant-key-v1.md`. The shared test vector is
+`tests/tenant_key_v1_vector.json` — identical bytes in every repository that
+implements it.
+
+Notes:
+
+- A SemBlend release from before the contract has no `cache_salt` argument.
+  The provider checks the signature and omits it rather than raising, so the
+  donor is registered without a tenant key rather than lost.
+- A vLLM request type that has no `cache_salt` field at all is a version
+  mismatch, not an unsalted deployment: every donor is then published with the
+  no-tenant sentinel and no placement can select it.
+  `cache_salt_for_request` warns once per process in that case (the request
+  carrying the field with no salt set is silent, because that is a real
+  answer).
+- The salt is hashed by SemBlend exactly as the request carried it — no
+  trimming, no case folding — so a caller that wants two requests to share one
+  tenant key must set byte-identical salts.
+- The raw salt is tenant-identifying and is never written to the audit trail
+  or a log line; only values derived from it are.

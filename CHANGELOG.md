@@ -7,6 +7,24 @@ between minor releases while the vLLM semantic KV interface is experimental.
 
 ## Unreleased
 
+- The request's raw `cache_salt` now reaches SemBlend, which publishes it as a
+  **tenant key** (`semblend:tenant:v1:<sha256(salt)[:32]>`, or the sentinel
+  `semblend:tenant:v1:none`) in the `DonorRegistered` event at
+  `namespace.extra.tenant_key`. The connector's per-request namespace, still
+  sent as the engine-local isolation key at `namespace.extra.cache_salt`,
+  digests the model, tokenizer, block size, dtype, salt and adapter, so no
+  router holding only the request could ever reproduce it; the tenant key is a
+  function of the salt alone, so whoever set the salt can compute it and scope
+  placement to one tenant. `SemanticLookupRequest` and `DonorRegistration`
+  gained a `cache_salt` field (default `None`, every existing construction site
+  unchanged), so a provider reads the salt off the record instead of reaching
+  back into vLLM's objects. The raw salt is never logged or audited. A request
+  type that carries no `cache_salt` field at all — a version mismatch rather
+  than an unsalted deployment — warns once per process, because it would
+  otherwise publish every donor tenant-less and silently. Contract:
+  `docs/VLLM_CONNECTOR_CONTRACT.md`, "Tenant key"; shared vector:
+  `tests/tenant_key_v1_vector.json`.
+
 - Blocks the connector fills are evicted from vLLM's exact prefix cache on
   the step they are filled, and the same pass runs again on every later step
   the request is scheduled, so the blocks vLLM hashes as the request

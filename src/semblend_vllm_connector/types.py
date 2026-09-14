@@ -79,6 +79,12 @@ class SemanticLookupRequest:
     prompt_text: str | None
     model_id: str
     namespace: str
+    # The request's RAW cache salt, carried beside the derived namespace so a
+    # provider never has to reach back into vLLM's objects for it. The
+    # namespace is engine-local (it digests dtype and block size, which are not
+    # request fields); the salt is what a caller holding the request can
+    # reproduce. See docs/VLLM_CONNECTOR_CONTRACT.md, "Tenant key".
+    cache_salt: str | None = None
     already_computed_tokens: int = 0
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
@@ -104,6 +110,9 @@ class DonorRegistration:
     prompt_text: str | None
     model_id: str
     namespace: str
+    #: The registering request's RAW cache salt; see
+    #: :class:`SemanticLookupRequest`.
+    cache_salt: str | None = None
     timestamp: float = field(default_factory=time.monotonic)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 

@@ -19,7 +19,11 @@ from semblend_vllm_connector._vllm_compat import (
     get_virtual_engine,
 )
 from semblend_vllm_connector.config import SemBlendVllmConfig
-from semblend_vllm_connector.namespace import model_id_from_config, namespace_for_request
+from semblend_vllm_connector.namespace import (
+    cache_salt_for_request,
+    model_id_from_config,
+    namespace_for_request,
+)
 from semblend_vllm_connector.provider import SemanticKvProvider, load_provider
 from semblend_vllm_connector.semantic_span import (
     block_align_spans,
@@ -1216,6 +1220,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             prompt_text=self._prompt_text(request),
             model_id=model_id_from_config(self._config, self._vllm_config),
             namespace=namespace,
+            cache_salt=cache_salt_for_request(request),
             already_computed_tokens=num_computed_tokens,
         )
 
@@ -2957,6 +2962,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 prompt_text=self._prompt_text(request),
                 model_id=model_id_from_config(self._config, self._vllm_config),
                 namespace=namespace_for_request(self._config, self._vllm_config, request),
+                # The raw salt as well as the namespace derived from it: the
+                # namespace digests engine-private inputs, so it is the salt
+                # that lets a caller holding the request identify this donor's
+                # tenant. Never logged.
+                cache_salt=cache_salt_for_request(request),
                 metadata={
                     "num_blocks": len(block_ids),
                     **self._routing_metadata(request),
