@@ -124,6 +124,23 @@ class SemBlendVllmConfig:
     skip_when_exact_prefix_ratio_at_least: float = 0.50
     lookup_top_k: int = 5
     enable_prompt_text: bool = False
+    # Whether the text a lookup hands the provider starts at the request's
+    # block-aligned exact-prefix boundary instead of at token 0. Providers
+    # that embed prompt text truncate it to their embedder's window (a MiniLM
+    # sentence encoder sees roughly the first 256 tokens, and SemBlend caps
+    # the text by characters on top of that), so with a wrapper in front of
+    # the content the whole window is wrapper: every request wrapped the same
+    # way embeds alike, and none of them embeds like the donor that holds the
+    # content. The boundary is where the exact prefix stops and therefore
+    # where the tokens this connector wants to serve begin, so it is also
+    # where the text that identifies them begins. Off restores 0.2.4
+    # behaviour for an A/B.
+    boundary_sliced_query_text: bool = True
+    # Floor under which a boundary-sliced text is not worth embedding; below
+    # it the full prompt text is sent instead and the audit names the
+    # fallback. A boundary near the prompt end leaves a few characters that
+    # identify nothing, and an embedding of them would match arbitrarily.
+    min_query_text_chars: int = 64
     log_decisions: bool = True
     audit_path: str | None = None
     kv_storage_path: str = "/tmp/semblend-vllm-kv"
@@ -229,6 +246,15 @@ class SemBlendVllmConfig:
             lookup_top_k=_read_int(extra, "lookup_top_k", "SEMBLEND_VLLM_LOOKUP_TOP_K", 5),
             enable_prompt_text=_read_bool(
                 extra, "enable_prompt_text", "SEMBLEND_VLLM_ENABLE_PROMPT_TEXT", False
+            ),
+            boundary_sliced_query_text=_read_bool(
+                extra,
+                "boundary_sliced_query_text",
+                "SEMBLEND_VLLM_BOUNDARY_SLICED_QUERY_TEXT",
+                True,
+            ),
+            min_query_text_chars=_read_int(
+                extra, "min_query_text_chars", "SEMBLEND_VLLM_MIN_QUERY_TEXT_CHARS", 64
             ),
             log_decisions=_read_bool(extra, "log_decisions", "SEMBLEND_VLLM_LOG_DECISIONS", True),
             audit_path=(

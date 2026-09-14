@@ -147,6 +147,139 @@ provider's candidate cut and push the one donor that does hold KV out of it.
 Providers must therefore drop donors whose `DonorRegistration.has_captured_kv`
 is false *before* the top-k cut, not after.
 
+### What a lookup embedded
+
+A provider that matches on prompt text embeds that text with a sentence
+encoder, and a sentence encoder truncates: a MiniLM model sees roughly the
+first 256 tokens of what it is handed, and SemBlend caps the text by characters
+(`SEMBLEND_EMBED_MAX_CHARS`, 4000 by default) before that. So only the *head*
+of the text decides the match, and if the head is a wrapper every request
+behind that wrapper embeds alike.
+
+The connector therefore hands the provider the prompt text from the request's
+block-aligned exact-prefix boundary onward rather than from token 0. The
+boundary is where vLLM's own prefix cache stops, which is where the tokens this
+connector is trying to serve begin and where the request stops looking like
+every other request behind the same wrapper. Donors are registered the same way
+-- from the boundary they were admitted at -- so both sides of a match embed the
+content and not the wrapper. `boundary_sliced_query_text=false` restores
+embedding from token 0 for an A/B.
+
+The character offset comes from decoding the *prefix* tokens and taking their
+length, not from an offset mapping over the whole prompt: the prefix is the
+short part and the prompt is not, and the token ids already name the position.
+The decode drops special tokens and strips, so the offset can be a few
+characters off; that moves where the embedded window starts by at most a word.
+
+`semantic_lookup_hit` and `semantic_lookup_miss` carry what was embedded:
+
+| Field | Meaning |
+| --- | --- |
+| `query_text_offset_tokens` | the token position the embedded text starts at; 0 means the whole prompt |
+| `query_text_chars` | the length in characters of the text handed to the provider |
+| `query_text_fallback` | `null` when the text is the slice, otherwise why it is not |
+
+`donor_registered` carries the same three as `donor_text_offset_tokens`,
+`donor_text_chars` and `donor_text_fallback`.
+
+| `*_text_fallback` | Meaning |
+| --- | --- |
+| `no_prompt_text` | no text was available at all (`enable_prompt_text` off, or no decode) |
+| `disabled_by_config` | `boundary_sliced_query_text` is off |
+| `offset_unavailable` | the prefix tokens could not be decoded, so there is no character offset |
+| `offset_past_prompt_text` | the decoded prefix is longer than the prompt text itself |
+| `below_min_chars` | the slice is shorter than `min_query_text_chars` and identifies nothing |
+
+Every fallback sends the full prompt text, which is what earlier releases
+always sent. A run whose misses all carry `query_text_offset_tokens=0` on
+wrapped prompts is the phase-0 failure reproducing, not a provider problem.
+
+### Capture cost
+
+Donor capture is not free and it is not off the critical path. `save_kv_layer`
+(connector.py:2867) is called by vLLM from inside the forward pass, once per
+layer per prefill chunk, and `_capture_layer` (connector.py:2899) does three
+synchronous things on that thread:
+
+1. gathers the window's slots out of the paged KV cache
+   (`_extract_kv_from_layer`, connector.py:1066);
+2. copies it to host memory with a blocking `.cpu()` on pageable memory
+   (connector.py:2930) -- no pinned staging buffer, no side stream, no
+   `non_blocking=True`, so the copy synchronizes the device;
+3. writes it out (`_write_captured_layer`, connector.py:3041): a `metadata.json`
+   rewrite on every layer of every chunk (connector.py:3051) plus, on the
+   `disk` tier, a `safetensors.save_file` on the same thread
+   (connector.py:3067).
+
+Under chunked prefill a resumed capture also reads the previous chunk back and
+concatenates it (connector.py:3028 and connector.py:2937), so a donor captured
+in *n* chunks copies its early tokens *n* times. `wait_for_save`
+(connector.py:3103) has nothing to wait for, because nothing was deferred.
+
+The copy is the whole prompt's KV. For Qwen2.5-7B-Instruct at fp16 -- 28
+layers, 4 KV heads, head_dim 128 -- that is 2 x 28 x 4 x 128 x 2 = 57,344 bytes
+per token, so ~1.2 GB at a 21.3K-token prompt and ~1.8 GB at 32K.
+
+Measured phase-0, 2026-09-14, stock vLLM 0.29, `register_donors=true` with
+capture on every request, `disk` tier on a local NVMe ext4 volume:
+
+| Run | Prompt tokens (median) | Stock + prefix cache TTFT (median) | Connector arm TTFT (median) | Delta |
+| --- | --- | --- | --- | --- |
+| 32K stream, 232 requests | 21,283 | 6.20 s | 14.80 s | +8.60 s |
+| 4K smoke, 24 requests | 3,706 | 0.83 s | 1.00 s | +0.17 s |
+
+The delta lands on every request whether or not it was served -- in that run 3
+of 231 lookups hit -- and it scales with the prompt, which is what a per-token
+KV copy does and what a lookup does not: lookup latency in the same audit was a
+median of 19 ms.
+
+`donor_capture_cost` is written by the worker role once per captured request,
+when the worker sees it finish:
+
+| Field | Meaning |
+| --- | --- |
+| `capture_ms` | wall time inside the per-layer save hooks for this request, all layers and chunks |
+| `copy_ms` | of that, the device-to-host copies |
+| `write_ms` | of that, the metadata and tensor writes |
+| `copy_bytes` | bytes that crossed to host memory, counted before any concatenation with earlier chunks |
+| `layers` | layers this request captured |
+| `store_tier` | `kv_storage_backend` |
+
+It is the worker's event, not a field on `donor_registered`, because the copy
+is the worker's: `request_finished` is scheduler-role and that connector is a
+different instance in a different process, which has never seen a tensor. Join
+the two on `request_id`. `donor_registered` and `capture_skipped` carry
+`store_tier` so the tier a cost was paid to -- or avoided -- is on both sides.
+The connector-level totals are `capture_ms_total`, `capture_copy_ms_total`,
+`capture_write_ms_total`, `capture_bytes_total` and `capture_layers_total`.
+
+**Proposed change, not implemented.** Taking the copy off the prefill critical
+path needs, in order of cost:
+
+1. *Capture fewer requests.* The cheapest and largest win, and no CUDA work at
+   all: a request that produced no lookup hit and is not flagged as a likely
+   donor need not be captured. Today `register_donors=true` means capture
+   every request, which pays the full per-token copy on traffic that will never
+   be matched. A policy flag (capture on hit, or on a caller-supplied donor
+   hint, or on a sampled fraction) turns an unconditional +8.6 s into a cost
+   paid by the donors alone.
+2. *Defer the write.* Hand `host_kv` to a single writer thread and return;
+   `wait_for_save` becomes the join. This removes `write_ms` and the
+   per-layer `metadata.json` rewrite from the forward pass without touching
+   the CUDA path. The writer must publish `metadata.json` only after the
+   tensors, since the scheduler role sizes spans against it.
+3. *Defer the copy.* Copy into a pinned host buffer on a side CUDA stream with
+   `non_blocking=True`, record an event, and let the writer thread wait on the
+   event rather than the forward pass. This is the part that needs real GPU
+   validation: the donor's slots stay valid for the life of the request, so a
+   late read is safe, but the pinned-buffer pool, the per-request event
+   bookkeeping and the interaction with the memory tier's LRU eviction are all
+   new failure surfaces. It should land behind `capture_async=false` and be
+   measured against the same phase-0 stream before the default moves.
+
+Steps 1 and 2 are independent of each other and of step 3. Step 1 is the one
+the measured numbers argue for first.
+
 ### Which prefix-cache number to compare across arms
 
 Both events carry the request's join key and two units, because the two arms

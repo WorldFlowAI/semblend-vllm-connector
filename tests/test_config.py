@@ -82,6 +82,7 @@ def test_config_parses_string_booleans() -> None:
                 {
                     "register_donors": "false",
                     "enable_prompt_text": "true",
+                    "boundary_sliced_query_text": "false",
                     "log_decisions": "off",
                 }
             )
@@ -89,6 +90,7 @@ def test_config_parses_string_booleans() -> None:
     )
     assert cfg.register_donors is False
     assert cfg.enable_prompt_text is True
+    assert cfg.boundary_sliced_query_text is False
     assert cfg.log_decisions is False
 
 
@@ -131,6 +133,8 @@ def test_getter_path_carries_every_config_field() -> None:
         "skip_when_exact_prefix_ratio_at_least": 0.25,
         "lookup_top_k": 3,
         "enable_prompt_text": "true",
+        "boundary_sliced_query_text": "false",
+        "min_query_text_chars": 128,
         "log_decisions": "false",
         "audit_path": "/tmp/a.jsonl",
         "kv_storage_path": "/tmp/kv",
@@ -159,6 +163,8 @@ def test_getter_path_carries_every_config_field() -> None:
     assert cfg.skip_when_exact_prefix_ratio_at_least == 0.25
     assert cfg.lookup_top_k == 3
     assert cfg.enable_prompt_text is True
+    assert cfg.boundary_sliced_query_text is False
+    assert cfg.min_query_text_chars == 128
     assert cfg.log_decisions is False
     assert cfg.audit_path == "/tmp/a.jsonl"
     assert cfg.kv_storage_path == "/tmp/kv"

@@ -290,6 +290,18 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # Scheduler-side state for donors still in prefill, so the chunks
         # after admission can be captured too.
         self._capture_state: dict[str, _CaptureState] = {}
+        # Scheduler-side: request id -> the exact-prefix boundary this donor
+        # was admitted at. Its registration text starts there for the same
+        # reason a lookup's query text does -- the tokens in front of it are a
+        # wrapper this donor shares with everything else behind that wrapper,
+        # and an embedder's window is short enough to hold nothing else.
+        # Absent (a seed, or an engine that reports no boundary) means 0, and
+        # the donor is registered with its whole text.
+        self._capture_boundaries: dict[str, int] = {}
+        # Worker-side: request id -> what its capture has cost so far
+        # (see _note_capture_cost). Reported once, when the worker sees the
+        # request finish, and retired with it.
+        self._capture_cost: dict[str, dict[str, float]] = {}
         # Request id -> the reason its capture was skipped, read at finish by
         # the donor registration. A request with no captured KV cannot supply
         # anything to anyone, so registering it can only take a candidate slot
@@ -544,6 +556,70 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         if text is None:
             self._note_prompt_text_unavailable("decode_unavailable")
         return text
+
+    def _boundary_sliced_text(
+        self, request: Any, token_ids: list[int], boundary: int, *, kind: str
+    ) -> tuple[str | None, int, int, str | None]:
+        """The request's prompt text from ``boundary`` onward, and what it cost.
+
+        Returns ``(text, offset_tokens, chars, fallback_reason)``.
+
+        A provider that embeds prompt text sees only what fits its embedder's
+        window -- the head of the string. The head of a wrapped prompt is the
+        wrapper, so every request behind the same wrapper embeds alike and
+        none of them embeds like a donor holding the same content unwrapped.
+        ``boundary`` is the end of the exact-prefix hit, which is both the
+        position past which this connector wants to serve and the position at
+        which this request stops looking like every other one, so it is where
+        the text handed to the provider starts.
+
+        The character offset comes from decoding the prefix tokens rather than
+        re-tokenizing the prompt: the prefix is the part that is short (the
+        wrapper), while the prompt is the part that is not, and an offset
+        mapping would cost a full re-tokenization of the whole prompt to
+        locate a position the token ids already name. The decode drops special
+        tokens and strips, so the offset can be off by the few characters
+        those occupied; that moves where the embedded window starts by a word
+        at most and never changes which document it is a window into.
+
+        Every path that cannot produce a usable slice returns the full prompt
+        text with the reason, so a run never silently embeds something other
+        than what its audit says it embedded.
+        """
+        full = self._prompt_text(request)
+        if full is None:
+            return None, 0, 0, "no_prompt_text"
+        if not self._config.boundary_sliced_query_text:
+            return full, 0, len(full), "disabled_by_config"
+        if boundary <= 0 or boundary >= len(token_ids):
+            # Nothing in front of the content (a seed), or a boundary past the
+            # prompt: the full text already starts where the slice would.
+            return full, 0, len(full), None
+        offset = self._prefix_char_offset(token_ids, boundary)
+        if offset is None:
+            return full, 0, len(full), self._note_text_slice_fallback(kind, "offset_unavailable")
+        if offset >= len(full):
+            return (
+                full,
+                0,
+                len(full),
+                self._note_text_slice_fallback(kind, "offset_past_prompt_text"),
+            )
+        sliced = full[offset:]
+        if len(sliced) < self._config.min_query_text_chars:
+            return full, 0, len(full), self._note_text_slice_fallback(kind, "below_min_chars")
+        self._stats[f"{kind}_text_sliced_total"] += 1
+        return sliced, int(boundary), len(sliced), None
+
+    def _prefix_char_offset(self, token_ids: list[int], boundary: int) -> int | None:
+        """Characters the first ``boundary`` tokens occupy, or None."""
+        prefix = self._decode_prompt_tokens(list(token_ids[:boundary]))
+        return None if prefix is None else len(prefix)
+
+    def _note_text_slice_fallback(self, kind: str, reason: str) -> str:
+        """Count one text that could not be sliced, and hand back its reason."""
+        self._stats[f"{kind}_text_fallback_{reason}"] += 1
+        return reason
 
     def _note_prompt_text_unavailable(self, reason: str) -> None:
         """Record, once per reason, that lookups run without prompt text.
@@ -1263,25 +1339,38 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             return 0, False
 
         namespace = namespace_for_request(self._config, self._vllm_config, request)
-        lookup = SemanticLookupRequest(
-            request_id=request_id,
-            token_ids=token_ids,
-            prompt_text=self._prompt_text(request),
-            model_id=model_id_from_config(self._config, self._vllm_config),
-            namespace=namespace,
-            cache_salt=cache_salt_for_request(request),
-            already_computed_tokens=num_computed_tokens,
-        )
 
         # A waiting request re-enters this hook on every scheduling step. The
         # lookup itself is memoized; the counters and audit events have to be
         # too, or the per-request reuse metrics they feed scale with queueing
-        # depth instead of with traffic.
+        # depth instead of with traffic. Building the lookup request is inside
+        # the same branch: deriving its text decodes the prefix tokens, and
+        # only the branch that actually consults the provider needs it.
         first_lookup = request_id not in self._lookup_cache
+        query_offset_tokens = 0
+        query_text_chars = 0
+        query_text_fallback: str | None = None
         if not first_lookup:
             result = self._lookup_cache[request_id]
             elapsed_ms = 0
         else:
+            (
+                query_text,
+                query_offset_tokens,
+                query_text_chars,
+                query_text_fallback,
+            ) = self._boundary_sliced_text(
+                request, token_ids, int(num_computed_tokens), kind="query"
+            )
+            lookup = SemanticLookupRequest(
+                request_id=request_id,
+                token_ids=token_ids,
+                prompt_text=query_text,
+                model_id=model_id_from_config(self._config, self._vllm_config),
+                namespace=namespace,
+                cache_salt=cache_salt_for_request(request),
+                already_computed_tokens=num_computed_tokens,
+            )
             started = time.monotonic()
             try:
                 result = self._provider.lookup(lookup)
@@ -1316,6 +1405,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     attempt=attempt,
                     namespace=namespace,
                     latency_ms=elapsed_ms,
+                    boundary=int(num_computed_tokens),
+                    # What was embedded, not what was available to embed: a
+                    # miss whose query text was the wrapper and a miss whose
+                    # query text was the content are different failures.
+                    query_text_offset_tokens=int(query_offset_tokens),
+                    query_text_chars=int(query_text_chars),
+                    query_text_fallback=query_text_fallback,
                 )
             if self._config.log_decisions and first_lookup:
                 logger.info(
@@ -1343,6 +1439,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 confidence_tier=str(
                     (result.quality_signals or {}).get("confidence_tier", "unknown")
                 ),
+                query_text_offset_tokens=int(query_offset_tokens),
+                query_text_chars=int(query_text_chars),
+                query_text_fallback=query_text_fallback,
             )
         if self._config.log_decisions and first_lookup:
             logger.info(
@@ -2109,7 +2208,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         """
         self._capture_skipped_reasons[request_id] = reason
         self._stats[f"capture_skipped_{reason}"] += 1
-        self._audit_event("capture_skipped", request_id=request_id, reason=reason, **fields)
+        self._audit_event(
+            "capture_skipped",
+            request_id=request_id,
+            reason=reason,
+            # The tier this capture would have been written to, so the cost a
+            # skip avoided is read off the same field as the cost one paid.
+            store_tier=self._config.kv_storage_backend,
+            **fields,
+        )
 
     def _build_store_metadata(self, scheduler_output: "SchedulerOutput") -> list[PendingStore]:
         if not self._materialization_enabled():
@@ -2117,9 +2224,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             return []
         for finished_id in getattr(scheduler_output, "finished_req_ids", None) or ():
             self._capture_state.pop(str(finished_id), None)
-            # request_finished has already read and retired this; the pop is
+            # request_finished has already read and retired these; the pops are
             # here so an engine that never calls it leaks nothing.
             self._capture_skipped_reasons.pop(str(finished_id), None)
+            self._capture_boundaries.pop(str(finished_id), None)
         scheduled_tokens = getattr(scheduler_output, "num_scheduled_tokens", None)
         return [
             *self._capture_admitted(scheduler_output, scheduled_tokens),
@@ -2160,6 +2268,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             if block_ids is None:
                 self._note_capture_skipped(request_id, "no_block_ids", prompt_tokens=len(token_ids))
                 continue
+            # The boundary this donor was admitted at, kept for its
+            # registration at finish. Read here because this is the one place
+            # the scheduler hands the connector a request's own exact-prefix
+            # hit before the forward pass moves it.
+            self._capture_boundaries[request_id] = int(
+                getattr(new_req, "num_computed_tokens", 0) or 0
+            )
             state = _CaptureState(
                 token_ids=token_ids,
                 block_ids=block_ids,
@@ -2794,6 +2909,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         """
         import torch
 
+        started = time.monotonic()
         progress = self._capture_progress.get(store.request_id, {})
         start = progress.get(layer_name, 0)
         if start >= store.token_count:
@@ -2810,13 +2926,84 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             store.block_ids, store.token_count - start, kv_layer.device, target_start=start
         )
         kv_cache = self._extract_kv_from_layer(kv_layer, slot_mapping, attn_metadata)
+        copy_started = time.monotonic()
         host_kv = kv_cache.detach().contiguous().cpu()
+        copy_ms = (time.monotonic() - copy_started) * 1000.0
+        # Measured before the concat with the earlier chunks: this is what
+        # crossed the PCIe link on this call, not what the donor now holds.
+        copy_bytes = int(host_kv.numel()) * int(host_kv.element_size())
         if base is not None:
             # MLA captures are [tokens, C]; every other layout [2, tokens, H*D].
             host_kv = torch.cat((base, host_kv), dim=0 if host_kv.dim() == 2 else 1)
         actual_token_count = start + int(slot_mapping.numel())
+        write_started = time.monotonic()
         self._write_captured_layer(store, layer_name, host_kv, actual_token_count)
+        write_ms = (time.monotonic() - write_started) * 1000.0
         self._capture_progress[store.request_id] = {**progress, layer_name: actual_token_count}
+        self._note_capture_cost(
+            store.request_id,
+            capture_ms=(time.monotonic() - started) * 1000.0,
+            copy_ms=copy_ms,
+            write_ms=write_ms,
+            copy_bytes=copy_bytes,
+        )
+
+    def _note_capture_cost(
+        self,
+        request_id: str,
+        *,
+        capture_ms: float,
+        copy_ms: float,
+        write_ms: float,
+        copy_bytes: int,
+    ) -> None:
+        """Accumulate what one layer of one capture cost this request.
+
+        Every number here is wall time inside ``save_kv_layer``, which vLLM
+        calls from the forward pass, so the total is time the request's own
+        prefill did not spend prefilling. It is accumulated per request rather
+        than emitted per layer because a model has one of these per layer per
+        chunk and the audit would otherwise be mostly capture rows; the
+        request's total is written once, when the worker sees it finish.
+        """
+        running = self._capture_cost.get(request_id)
+        if running is None:
+            running = {"capture_ms": 0.0, "copy_ms": 0.0, "write_ms": 0.0, "copy_bytes": 0.0}
+            self._capture_cost[request_id] = running
+        running["capture_ms"] += capture_ms
+        running["copy_ms"] += copy_ms
+        running["write_ms"] += write_ms
+        running["copy_bytes"] += float(copy_bytes)
+        self._stats["capture_layers_total"] += 1
+
+    def _report_capture_cost(self, request_id: str) -> None:
+        """Write this request's capture cost once, on the worker's finish hook.
+
+        The counters are added here rather than per layer so the rounding to
+        whole milliseconds happens once per request instead of once per layer
+        per chunk, where an 80-layer model would round away most of the total.
+        """
+        running = self._capture_cost.pop(request_id, None)
+        if running is None:
+            return
+        capture_ms = int(round(running["capture_ms"]))
+        copy_ms = int(round(running["copy_ms"]))
+        write_ms = int(round(running["write_ms"]))
+        copy_bytes = int(running["copy_bytes"])
+        self._stats["capture_ms_total"] += capture_ms
+        self._stats["capture_copy_ms_total"] += copy_ms
+        self._stats["capture_write_ms_total"] += write_ms
+        self._stats["capture_bytes_total"] += copy_bytes
+        self._audit_event(
+            "donor_capture_cost",
+            request_id=request_id,
+            capture_ms=capture_ms,
+            copy_ms=copy_ms,
+            write_ms=write_ms,
+            copy_bytes=copy_bytes,
+            layers=len(self._capture_progress.get(request_id, {})),
+            store_tier=self._config.kv_storage_backend,
+        )
 
     def _note_capture_base_missing(self, store: PendingStore, layer_name: str, start: int) -> None:
         """Record, once per store, that a chunked capture restarted from zero.
@@ -2922,9 +3109,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         #
         # This is also the worker's only finish hook: request_finished is
         # scheduler-role, so without retiring the join key here the worker's
-        # per-request maps grow for the life of the process. The worker emits
-        # no event for a finished request, so the key is retired with it.
+        # per-request maps grow for the life of the process. The capture cost
+        # is the one event the worker writes here, and it is written before
+        # the key it joins on is retired.
         for request_id in finished_req_ids or ():
+            self._report_capture_cost(str(request_id))
             self._capture_progress.pop(str(request_id), None)
             self._capture_base_missing_noted.pop(str(request_id), None)
             self._capture_skipped_reasons.pop(str(request_id), None)
@@ -2970,6 +3159,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # After the registration, which is the only reader: vLLM reuses
             # request ids, so a reason left behind would decide the next use.
             self._capture_skipped_reasons.pop(request_id, None)
+            self._capture_boundaries.pop(request_id, None)
             # Last, so the join key outlives every event this finish emits.
             self._forget_request_join_key(request_id)
         return False, None
@@ -3042,11 +3232,23 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             )
             return
 
+        # Registered from this donor's own boundary onward, so the two sides of
+        # a match embed the same thing: a recipient's query text starts where
+        # its wrapper ends, and this has to start where the donor's does. A
+        # seed has no wrapper and no boundary, and is registered whole.
+        (
+            donor_text,
+            donor_text_offset,
+            donor_text_chars,
+            donor_text_fallback,
+        ) = self._boundary_sliced_text(
+            request, token_ids, int(self._capture_boundaries.get(request_id, 0)), kind="donor"
+        )
         try:
             donor = DonorRegistration(
                 donor_id=self._request_id(request),
                 token_ids=token_ids,
-                prompt_text=self._prompt_text(request),
+                prompt_text=donor_text,
                 model_id=model_id_from_config(self._config, self._vllm_config),
                 namespace=namespace_for_request(self._config, self._vllm_config, request),
                 # The raw salt as well as the namespace derived from it: the
@@ -3068,6 +3270,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 tokens=len(token_ids),
                 blocks=len(block_ids),
                 metadata=dict(donor.metadata),
+                donor_text_offset_tokens=int(donor_text_offset),
+                donor_text_chars=int(donor_text_chars),
+                donor_text_fallback=donor_text_fallback,
+                store_tier=self._config.kv_storage_backend,
             )
             if self._config.log_decisions:
                 logger.info(

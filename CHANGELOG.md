@@ -5,6 +5,56 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
+## Unreleased
+
+Both entries come from the phase-0 LongBench-v2 pass of 2026-09-14 on stock
+vLLM 0.29: 232 requests, prompts with a median of 21.3K tokens, each document
+sent once as a seed and once again behind a 512-token operator preamble.
+
+- A lookup now embeds the prompt text from the request's block-aligned
+  exact-prefix boundary onward instead of from token 0, and a donor is
+  registered with the text from its own boundary onward. In the measured run
+  228 of 231 lookups missed although every recipient duplicated a document a
+  donor already held. The provider embeds prompt text with a sentence encoder,
+  which truncates to its model window -- roughly the first 256 tokens for
+  MiniLM, and SemBlend caps the text by characters before that -- so with a
+  512-token preamble in front of the document the entire embedded window was
+  preamble. Every recipient embedded alike, and none of them embedded like the
+  seed it duplicated. The boundary is where vLLM's own prefix cache stops,
+  which is both where the tokens this connector wants to serve begin and where
+  the request stops looking like every other request behind the same wrapper.
+  The character offset is taken by decoding the prefix tokens and measuring
+  them, not by re-tokenizing the whole prompt for an offset mapping.
+  `semantic_lookup_hit` and `semantic_lookup_miss` gained
+  `query_text_offset_tokens`, `query_text_chars` and `query_text_fallback`, and
+  `donor_registered` the same three under `donor_text_*`, so a run says what it
+  embedded rather than leaving it to be inferred. A slice that is empty,
+  undecodable or shorter than `min_query_text_chars` (default 64) falls back to
+  the full prompt text and names the reason in that field.
+  `boundary_sliced_query_text=false` restores the previous behaviour for an A/B.
+
+- Donor capture is now instrumented, because it was the arm's dominant cost and
+  nothing in the audit said so. Median TTFT was 14.80 s on the connector arm
+  against 6.20 s on stock vLLM with prefix caching -- +8.6 s on every request,
+  served or not, where only 3 of 231 lookups hit -- while the same
+  configuration at 3.7K-token prompts cost +0.17 s. That scaling is a per-token
+  KV copy, not a lookup: lookup latency in the same audit had a median of 19 ms,
+  and at 21.3K tokens the capture copies ~1.2 GB of KV out of the GPU inside
+  the forward pass. The worker now writes one `donor_capture_cost` event per
+  captured request carrying `capture_ms`, `copy_ms`, `write_ms`, `copy_bytes`,
+  `layers` and `store_tier`, with `capture_ms_total`, `capture_copy_ms_total`,
+  `capture_write_ms_total`, `capture_bytes_total` and `capture_layers_total` as
+  the connector totals; `donor_registered` and `capture_skipped` gained
+  `store_tier`. The event is the worker's and not a field on `donor_registered`
+  because the copy is the worker's, and the scheduler-role connector that
+  writes that event is a different instance in a different process; join them
+  on `request_id`.
+  Behaviour is unchanged: the copy and the write are still synchronous on the
+  forward pass. docs/VLLM_CONNECTOR_CONTRACT.md gained a "Capture cost" section
+  with the measured numbers, the line-level read of the path, and the staged
+  proposal for taking it off the critical path -- capture fewer requests first,
+  then defer the write, then the copy.
+
 ## 0.2.4 - 2026-09-14
 
 Both entries are fixes for behaviour measured live in phase-0 E6
