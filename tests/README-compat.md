@@ -37,6 +37,20 @@ checkout of the same release:
 SEMBLEND_VLLM_SOURCE=/path/to/vllm-0.29.0 pytest tests/
 ```
 
+Keep that checkout somewhere durable. On 2026-09-16 the armed suite had been
+pointed at a path under the system temp directory; the tree was cleaned out
+from under it, and because the loader falls back rather than failing, a run
+against a different vLLM release reported three failures that looked like
+regressions and were not. A shallow checkout is enough and costs about 160 MB:
+
+```bash
+git clone --depth 1 --filter=blob:none --branch v0.29.0 \
+  https://github.com/vllm-project/vllm.git ~/dev/worldflowai/vllm-0290
+```
+
+Set `SEMBLEND_REQUIRE_VLLM_GUARDS=1` alongside it so a source tree that cannot
+be loaded fails the run instead of quietly skipping the guards.
+
 A job whose point is the compatibility check should not depend on a human
 reading that header. Set `SEMBLEND_REQUIRE_VLLM_GUARDS=1` and the run fails
 outright rather than skipping:
