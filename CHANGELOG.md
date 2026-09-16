@@ -5,7 +5,7 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
-## Unreleased
+## 0.2.6 - 2026-09-16
 
 Donor capture no longer writes on the engine's prefill thread. Measured in the
 same phase-0 pass of 2026-09-14 on stock vLLM 0.29 with an A10G: per captured
