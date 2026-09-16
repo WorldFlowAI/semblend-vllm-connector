@@ -8,6 +8,7 @@ behaviour it describes.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from test_b6_contamination import (
@@ -137,3 +138,35 @@ def test_the_contract_documents_the_only_event_that_names_block_ids(tmp_path) ->
     contract = _prose("docs/VLLM_CONNECTOR_CONTRACT.md")
     assert "`block_ids_left_cached`" in contract
     assert "block_ids_evicted" not in contract
+
+
+def test_every_capture_counter_the_code_emits_is_in_the_contract() -> None:
+    """A counter nobody documented is a silent outcome nobody can diagnose.
+
+    Two of them shipped that way in this change -- `capture_metadata_skipped_evicted`
+    and `capture_finalize_skipped_write_failed`, both of which name a donor
+    that was captured and then never published. An operator looking at an
+    empty donor pool has the counter and nothing that says what it means, so
+    the doc gate covers the whole capture family by construction rather than
+    one claim at a time.
+    """
+    source = (REPO_ROOT / "src" / "semblend_vllm_connector" / "connector.py").read_text(
+        encoding="utf-8"
+    )
+    emitted = set(re.findall(r'_stats\[\s*"([a-z0-9_]+)"\s*\]', source)) | set(
+        re.findall(r'_writer_count\(\s*"([a-z0-9_]+)"', source)
+    )
+    capture_counters = {
+        name
+        for name in emitted
+        if name.startswith("capture_") or name.startswith("donor_registration_skipped_not")
+    } | {"donor_registration_deferred_total"}
+    assert "capture_metadata_skipped_evicted" in capture_counters, (
+        "the scan stopped matching the code, so this gate proves nothing"
+    )
+
+    contract = _doc("docs/VLLM_CONNECTOR_CONTRACT.md")
+    undocumented = sorted(name for name in capture_counters if name not in contract)
+    assert undocumented == [], (
+        f"counters emitted by connector.py and documented nowhere: {undocumented}"
+    )

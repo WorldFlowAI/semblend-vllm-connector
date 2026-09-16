@@ -98,13 +98,17 @@ def _write_donor_capture(connector, request, donor_id, token_count) -> None:
         json.dump({"token_count": token_count}, f)
 
 
-def _pending_store(request_id, token_count, block_ids):
+def _pending_store(request_id, token_count, block_ids, final=True):
+    # final: this store completes the donor, which is what tells the worker to
+    # publish its metadata record. A capture the scheduler has not closed is
+    # deliberately not publishable.
     return PendingStore(
         request_id=request_id,
         token_ids=list(range(token_count)),
         token_count=token_count,
         namespace="ns",
         block_ids=block_ids,
+        final=final,
     )
 
 
@@ -277,6 +281,9 @@ def _save_memory_donor(connector, donor_id, kv_layer, token_count=4) -> None:
         )
     )
     connector.save_kv_layer("layer0", kv_layer, attn_metadata=object())
+    # The end of the step vLLM saved from: the writer is joined here, so the
+    # donor is on the store rather than in the queue.
+    connector.wait_for_save()
 
 
 def test_b4_eviction_clears_metadata_and_missing_donor_declines(tmp_path) -> None:
@@ -379,6 +386,51 @@ def test_b4_semantic_span_load_against_missing_donor_fails_loud(tmp_path) -> Non
     assert stats.get("loads_materialized_total", 0) == 0
 
 
+def test_b4_a_layer_left_unreadable_declines_like_a_missing_one(tmp_path) -> None:
+    """A truncated layer file is what a write that failed part-way leaves.
+
+    The store filling up mid-``save_file`` leaves a file safetensors refuses
+    to parse, and it raises its own error type for that -- not an OSError. A
+    load site that catches only OSError lets it out of ``start_load_kv`` and
+    into the engine's forward pass. Unreadable and absent are the same donor
+    from here, and both are declines.
+    """
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("safetensors")
+
+    loading = _connector(tmp_path, KVConnectorRole.WORKER)
+    donor_dir = loading._donor_dir("truncated", "ns")  # noqa: SLF001
+    os.makedirs(donor_dir, exist_ok=True)
+    # A record, so the donor is advertised, and a layer file that stops in
+    # the middle of its own header.
+    with open(os.path.join(donor_dir, "metadata.json"), "w") as f:
+        json.dump({"token_count": 4}, f)
+    with open(os.path.join(donor_dir, "layer0.safetensors"), "wb") as f:
+        f.write(b'\x40\x00\x00\x00\x00\x00\x00\x00{"kv_cache"')
+
+    loading.register_kv_caches({"layer0": torch.zeros(2, 6, 4, 2, 8)})
+    loading.bind_connector_metadata(
+        SemBlendConnectorMetadata(
+            loads=[
+                PendingLoad(
+                    request_id="r1",
+                    donor_id="truncated",
+                    token_count=4,
+                    materialization_kind=MaterializationKind.REQUEST_ONLY,
+                    namespace="ns",
+                    block_ids=([0],),
+                )
+            ]
+        )
+    )
+
+    loading.start_load_kv(FakeForwardContext(attn_metadata=object()))
+
+    stats = loading.stats_snapshot
+    assert stats.get("load_declined_donor_gone", 0) == 1
+    assert stats.get("loads_materialized_total", 0) == 0
+
+
 def test_b4_memory_backend_evicts_least_recently_used_donor(tmp_path) -> None:
     """Eviction order must follow use, not arrival.
 
@@ -471,8 +523,16 @@ def test_b5_donor_capture_clamped_to_the_first_chunk(
         torch.zeros(2, len(new_req.block_ids[0]), block_size, 2, 8),
         attn_metadata=object(),
     )
+    worker.wait_for_save()
 
     stored = metadata.stores[0]
+    if not stored.final:
+        # Mid-prefill this donor is deliberately not discoverable. The record
+        # is what publishes it, and it is written when the capture closes --
+        # here, because the request finished before the rest of the prompt.
+        assert not os.path.exists(worker._donor_metadata_path("d1", stored.namespace))  # noqa: SLF001
+    worker.get_finished({"d1"})
+
     with open(worker._donor_metadata_path("d1", stored.namespace), encoding="utf-8") as f:  # noqa: SLF001
         published = json.load(f)
     assert published["token_count"] == expected_capture

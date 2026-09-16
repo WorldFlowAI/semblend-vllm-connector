@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from semblend_vllm_connector.capture_writer import close_live_writers
+
 SOURCE_ENV = "SEMBLEND_VLLM_SOURCE"
 REQUIRE_ENV = "SEMBLEND_REQUIRE_VLLM_GUARDS"
 
@@ -206,6 +208,20 @@ def pytest_report_header(config) -> list[str]:
         f"real-vLLM type guards: ACTIVE via {VLLM_TYPES.origin} [{loaded}]",
         *[f"  note: {note}" for note in VLLM_TYPES.notes],
     ]
+
+
+@pytest.fixture(autouse=True)
+def _close_capture_writers():
+    """Stop every capture writer a test left running, before the next test.
+
+    A connector starts its writer on the first captured layer and stops it in
+    ``shutdown``; a test that never calls shutdown would otherwise leave a
+    thread and a queue of host tensors alive for the rest of the session. The
+    close is bounded, so a test that deliberately wedges a store costs the
+    writer's close timeout here and does not hang the run.
+    """
+    yield
+    close_live_writers()
 
 
 @pytest.fixture(scope="session")

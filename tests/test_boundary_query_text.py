@@ -18,6 +18,7 @@ to appear, which is the point.
 from __future__ import annotations
 
 import json
+import os
 
 from test_connector_discovery import (
     FakeCacheConfig,
@@ -29,6 +30,7 @@ from test_connector_discovery import (
 
 from semblend_vllm_connector._vllm_compat import KVConnectorRole
 from semblend_vllm_connector.connector import SemBlendVllmConnector
+from semblend_vllm_connector.namespace import namespace_for_request
 
 # One token decodes to one fixed-width word, so a prefix of N tokens is exactly
 # N * _WORD_CHARS characters of prompt text and every offset in these tests is
@@ -124,6 +126,19 @@ def _events(tmp_path, name: str) -> list[dict]:
     path = tmp_path / "audit.jsonl"
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
     return [row for row in rows if row["event"] == name]
+
+
+def _write_donor_record(connector, request, store) -> None:
+    """The record the worker publishes once a donor's layers are durable.
+
+    A donor is registered only after this file exists, so a scheduler-side
+    test that opens a capture has to stand up the worker's half of it.
+    """
+    namespace = namespace_for_request(connector._config, connector._vllm_config, request)  # noqa: SLF001
+    os.makedirs(connector._donor_dir(store.request_id, namespace), exist_ok=True)  # noqa: SLF001
+    path = connector._donor_metadata_path(store.request_id, namespace)  # noqa: SLF001
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"token_count": int(store.token_count)}, f)
 
 
 def _seed_and_recipient(connector):
@@ -244,8 +259,11 @@ def test_a_wrapped_donor_is_registered_from_its_own_boundary(tmp_path) -> None:
     new_req.req_id = "d1"
     new_req.block_ids = ([0, 1, 2, 3, 4, 5, 6, 7],)
     new_req.num_computed_tokens = len(_PREAMBLE_TOKENS)
-    connector.build_connector_meta(FakeSchedulerOutput(scheduled_new_reqs=[new_req]))
+    metadata = connector.build_connector_meta(FakeSchedulerOutput(scheduled_new_reqs=[new_req]))
     assert connector._capture_boundaries["d1"] == len(_PREAMBLE_TOKENS)  # noqa: SLF001
+    # The worker's half: a donor is registered only once its capture is
+    # readable, so the record the worker writes has to exist by now.
+    _write_donor_record(connector, new_req, metadata.stores[0])
 
     connector.request_finished(FakeRequest("d1", list(donor_tokens)), [0])
 

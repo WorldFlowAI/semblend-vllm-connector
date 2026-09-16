@@ -5,6 +5,106 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
+## Unreleased
+
+Donor capture no longer writes on the engine's prefill thread. Measured in the
+same phase-0 pass of 2026-09-14 on stock vLLM 0.29 with an A10G: per captured
+request the medians were `capture_ms` 14,535, `copy_ms` 119, `write_ms` 6,726
+and `copy_bytes` 1,254 MB, while engine TTFT went from 6.20 s to 14.80 s at
+21.3K-token prompts and from 0.83 s to 1.00 s at 3.7K. The device-to-host copy
+was never the cost -- 119 ms of a 14.5 s capture -- so what moves here is
+everything behind it.
+
+- The safetensors write, the donor's metadata record and the directory work
+  behind them now run on one background writer owned by the connector, fed by
+  a bounded FIFO queue (`capture_write_queue_depth`, 64 by default). The
+  per-layer host copy stays on the forward thread, because it reads the paged
+  KV cache that thread owns. `wait_for_save` is the join it was always
+  documented to be, and it is also where a completed donor is published, so
+  the record can never overtake the tensors it describes. When the queue is
+  full the forward pass waits rather than dropping a layer -- a dropped layer
+  would leave a donor advertising bytes nobody wrote -- and the wait is
+  counted (`capture_write_queue_blocked_total`, `write_blocked_ms` on
+  `donor_capture_cost`, one `capture_write_queue_full` row per request). The
+  writer is stopped in the connector's `shutdown` and again at interpreter
+  exit. Every wait in that stop -- handing the writer its stop signal
+  included, because a wedged store leaves the queue full and an unbounded put
+  there never returns -- is inside one deadline
+  (`capture_write_close_timeout_s`, 5 s by default), split so that queueing
+  the pending records cannot spend the drain's half of it; a store that has
+  stopped responding costs that much at teardown and warns, rather than
+  hanging the process. Whatever that deadline leaves in the queue is handed
+  back as a failed write (`donor_capture_write_failed`,
+  `capture_write_errors_total`) rather than left outstanding, so the
+  `wait_for_save` of a step that ran after a teardown returns instead of
+  joining work nobody will run. `write_ms` keeps its meaning -- what the write
+  cost the forward pass -- and loses its old content: it is now the handoff.
+- **The write is overlapped, not eliminated.** vLLM calls `wait_for_save`
+  inside the same `execute_model` as the save hooks, so whatever the writer
+  has not finished when the step ends is still paid on the forward thread. It
+  is now measured: `flush_ms` on `donor_capture_cost` and
+  `capture_flush_ms_total`. A step with nothing to overlap against pays the
+  same wall time as before; the win is per-layer pipelining. Compare a
+  post-change phase-0 capture as `capture_ms + flush_ms` against the old
+  `capture_ms`, never against `capture_ms` alone.
+- `metadata.json` is written once per donor, when the capture completes,
+  rather than once per layer per prefill chunk. That record is now the donor's
+  visibility: `_has_stored_donor` reads its presence and not the donor
+  directory, which exists from the first layer written into it. A partially
+  captured donor is therefore no longer matchable mid-prefill.
+- **A donor is never discoverable before its bytes are readable.**
+  Registration with the provider happens only after the writer has durably
+  written every layer and the metadata record for that donor. The record is
+  looked for under the namespace the *capture* was opened with, not one
+  recomputed at finish: vLLM hands the capture hook a `NewRequestData`, which
+  has no `cache_salt` field, and the finish hook a `Request`, which does, and
+  the namespace digest folds the salt in -- so a gate keyed on the finish side
+  would stat a directory the worker never writes to and decline every donor on
+  any tenant-salted deployment. A write that failed leaves
+  `donor_capture_write_failed` and `capture_write_errors_total` on the worker
+  side and never publishes the donor at all. The two roles are different
+  connector instances in different processes: join them on `request_id`.
+- **A capture that is not readable yet is retried, not declined.** vLLM's
+  `Scheduler._free_request` calls `request_finished` before the id reaches
+  `finished_req_ids`, so a request that finishes while its capture is still
+  open has that capture closed by the worker one step *after* the registration
+  hook ran. Such a donor is held for `donor_registration_retry_steps`
+  *scheduler steps* (8 by default) -- a budget aged on the step clock alone,
+  so a batch of finishes inside one step cannot spend it before the worker has
+  a step to publish in -- retried at every recurring scheduler-role hook and
+  once more at `shutdown`, which is terminal; it leaves
+  `donor_registration_deferred` and registers with `deferred_steps` naming the
+  wait. Only a record that never appears is a decline --
+  `donor_registration_skipped reason="capture_not_durable"` with
+  `donor_registration_skipped_not_durable`.
+- **A capture nobody published is deleted by the worker that owns it**
+  (`capture_orphan_discarded`, `capture_orphans_discarded_total`): the disk
+  tier has no eviction of its own, so layer files with no record would sit
+  unreferenced and unmatchable for the life of the volume. The worker's finish
+  hook joins its own writer before it looks, so past that join a missing
+  record means no record is coming. The scheduler role never deletes: it is
+  another process, a capture it sees no record for may still be in the
+  worker's queue, and taking a layer there leaves the writer publishing that
+  donor's record over a hole. Publishing re-checks the layers the record is
+  about to vouch for as a last line, so a record never names a layer that is
+  not on the store.
+- `capture_policy` chooses which requests become donors: `all` (the default,
+  and byte-for-byte the selection every earlier release made, because the
+  phase-0 manifests predict donors from it), `sampled` at
+  `capture_sample_rate` keyed on `sha256(request_id)` so a rerun captures the
+  same set, or `hinted`, which captures only requests a router marked --
+  through `extra_args={"semblend_capture": true}` on the sampling params
+  (`vllm_xargs` from the OpenAI server), an `x-semblend-capture` header or
+  metadata key, or an attribute of that name. The key is `capture_hint_key`.
+  Declines are audited as `capture_skipped` with `not_sampled` / `not_hinted`.
+  Capturing only on a lookup hit is deliberately not offered: a seed never
+  hits, so that policy would never fill a donor pool.
+- `shutdown` submits the pending metadata records before it stops the writer,
+  so a donor whose layers all landed at teardown is discoverable rather than
+  durable-and-invisible, and it keeps the closed writer on the connector: a
+  `save_kv_layer` after shutdown is a named write failure instead of a
+  silently restarted thread.
+
 ## 0.2.5 - 2026-09-14
 
 The quickstart now says to run the semantic-span mode with prefix caching

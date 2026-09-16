@@ -157,9 +157,11 @@ def test_memory_backend_round_trips_without_files(tmp_path, monkeypatch):
         token_count=8,
         namespace="ns",
         block_ids=([0, 1],),
+        final=True,
     )
     connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[], stores=[store]))
     connector.save_kv_layer(layer_name, src_layer, object())
+    connector.wait_for_save()
     assert calls["save"] == 0
     assert connector._stored_donor_token_count("d1", "ns") == 8  # noqa: SLF001
 
@@ -213,9 +215,11 @@ def test_memory_backend_evicts_oldest(tmp_path, monkeypatch):
             token_count=4,
             namespace="ns",
             block_ids=([i],),
+            final=True,
         )
         connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[], stores=[store]))
         connector.save_kv_layer(layer_name, layer, object())
+        connector.wait_for_save()
     keys = list(connector._memory_store.keys())  # noqa: SLF001
     assert len(keys) == 2
     assert connector._storage_key("a", "ns") not in keys  # noqa: SLF001

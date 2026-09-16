@@ -165,7 +165,12 @@ def _serve_once(connector, request) -> int:
     matched, _ = connector.get_num_new_matched_tokens(request, BOUNDARY)
     connector.update_state_after_alloc(request, FakeBlocks(blocks), matched)
     scheduled = _ScheduledNewReq(request.request_id, list(request.all_token_ids), blocks)
-    connector.build_connector_meta(FakeSchedulerOutput(scheduled_new_reqs=[scheduled]))
+    metadata = connector.build_connector_meta(FakeSchedulerOutput(scheduled_new_reqs=[scheduled]))
+    for store in metadata.stores:
+        # The worker's half of the same step: a capture the scheduler queued
+        # lands before the request finishes, which is the order the
+        # registration gate requires of a donor.
+        _write_donor_capture(connector, request, store.request_id, store.token_count)
     connector.request_finished(request, [0])
     return matched
 

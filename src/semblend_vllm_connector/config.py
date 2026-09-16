@@ -78,6 +78,30 @@ def _read_bool(extra: Mapping[str, Any], key: str, env: str, default: bool) -> b
     return _coerce_bool(extra.get(key, os.environ.get(env, default)), default)
 
 
+#: Every capture policy this connector understands; see ``capture_policy``.
+CAPTURE_POLICIES = ("all", "sampled", "hinted")
+
+
+def _read_capture_policy(extra: Mapping[str, Any]) -> str:
+    """The capture policy, falling back to the measured default when unknown.
+
+    An unrecognized value must not silently capture nothing: the donor pool
+    would be empty and every lookup would miss with no reason recorded. It
+    falls back to "all", which is what a deployment that never set the knob
+    gets, and says so.
+    """
+    raw = extra.get("capture_policy", os.environ.get("SEMBLEND_VLLM_CAPTURE_POLICY", "all"))
+    policy = str(raw).strip().lower()
+    if policy in CAPTURE_POLICIES:
+        return policy
+    logger.warning(
+        "SemBlend config: capture_policy=%r is not one of %s; capturing every eligible request",
+        raw,
+        ", ".join(CAPTURE_POLICIES),
+    )
+    return "all"
+
+
 @dataclass(frozen=True)
 class SemBlendVllmConfig:
     mode: ReuseMode = ReuseMode.DISCOVERY_ONLY
@@ -150,6 +174,46 @@ class SemBlendVllmConfig:
     # unless asked: the copy cost ~230 ms of the hit path at 3.5K tokens and
     # its donor already covers the content.
     capture_served_requests: bool = False
+    # Which admitted requests become donors: "all" (every eligible request,
+    # the measured default), "sampled" (a deterministic fraction, keyed on the
+    # request id so a rerun captures the same set), or "hinted" (only requests
+    # the caller marked). The capture is paid by the request being captured --
+    # ~1.2 GB of host copy at a 21.3K-token prompt -- so a deployment whose
+    # donors are known in advance can stop paying it on the rest of its
+    # traffic. "all" is the default because the phase-0 manifests predict
+    # which requests become donors from it.
+    capture_policy: str = "all"
+    # The fraction captured under capture_policy="sampled". Inert otherwise.
+    capture_sample_rate: float = 1.0
+    # The key capture_policy="hinted" looks for. Read from the request's
+    # sampling-params extra_args (vLLM's OpenAI server forwards `vllm_xargs`
+    # into it), from the request metadata/header mappings the routing keys
+    # come from -- both the bare key and "x-"-prefixed -- and from an
+    # attribute of that name on the request object.
+    capture_hint_key: str = "semblend_capture"
+    # How many donor writes may be queued for the writer thread before the
+    # forward pass has to wait for it. A full queue means the store is slower
+    # than the engine produces captures; the submitting thread blocks and the
+    # block is counted (capture_write_queue_blocked_total). Nothing is
+    # dropped: a dropped layer would leave a donor advertising bytes that were
+    # never written.
+    capture_write_queue_depth: int = 64
+    # How long teardown waits for the writer to drain, in seconds, covering
+    # the whole of the stop: a store that has wedged leaves the queue full, so
+    # handing the writer its stop signal is part of the wait and not ahead of
+    # it. This is what a process exit costs when the store has stopped
+    # responding, so it is short by default and the incomplete drain is
+    # warned about rather than waited out.
+    capture_write_close_timeout_s: float = 5.0
+    # How many scheduler steps a finished donor may wait for its own capture
+    # record before its registration is declined for good. Steps, not calls:
+    # a step that finishes a whole batch of requests spends none of this
+    # budget, because the worker has no chance to publish until the next one.
+    # vLLM frees a request before its id reaches finished_req_ids, so a
+    # capture still open at finish is closed by the worker one step after the
+    # registration hook ran: at 0 that donor is always declined although it
+    # was about to become readable.
+    donor_registration_retry_steps: int = 8
     # "disk" writes per-layer safetensors under kv_storage_path; "memory"
     # keeps donor layers in the worker's host RAM (no file I/O on capture or
     # load) with an LRU cap on donors.
@@ -175,6 +239,37 @@ class SemBlendVllmConfig:
                 f"min_semantic_span={self.min_semantic_span}: prompts in that range "
                 "are admitted to lookup but can never carry a servable span, so "
                 "each of those lookups is a guaranteed miss"
+            )
+        if self.capture_policy == "sampled" and self.capture_sample_rate <= 0.0:
+            warnings.append(
+                f"capture_policy=sampled with capture_sample_rate="
+                f"{self.capture_sample_rate}: no request is ever captured, so the "
+                "donor pool stays empty and every lookup misses"
+            )
+        if self.capture_policy == "sampled" and self.capture_sample_rate >= 1.0:
+            warnings.append(
+                f"capture_policy=sampled with capture_sample_rate="
+                f"{self.capture_sample_rate}: every eligible request is captured, "
+                "which is capture_policy=all under another name"
+            )
+        if self.donor_registration_retry_steps <= 0:
+            warnings.append(
+                f"donor_registration_retry_steps={self.donor_registration_retry_steps}: "
+                "a request that finishes while its capture is still open is declined "
+                "at once, and vLLM closes such a capture one step later, so those "
+                "donors are lost"
+            )
+        if self.capture_write_close_timeout_s <= 0.0:
+            warnings.append(
+                f"capture_write_close_timeout_s={self.capture_write_close_timeout_s}: "
+                "teardown does not wait for the capture writer at all, so donor "
+                "writes still queued at shutdown are abandoned"
+            )
+        if self.capture_write_queue_depth < 1:
+            warnings.append(
+                f"capture_write_queue_depth={self.capture_write_queue_depth} is below "
+                "1 and is read as 1: every captured layer then waits for the "
+                "previous one to land"
             )
         return tuple(warnings)
 
@@ -281,6 +376,36 @@ class SemBlendVllmConfig:
             ),
             capture_served_requests=_read_bool(
                 extra, "capture_served_requests", "SEMBLEND_VLLM_CAPTURE_SERVED_REQUESTS", False
+            ),
+            capture_policy=_read_capture_policy(extra),
+            capture_sample_rate=_read_float(
+                extra, "capture_sample_rate", "SEMBLEND_VLLM_CAPTURE_SAMPLE_RATE", 1.0
+            ),
+            capture_hint_key=str(
+                extra.get(
+                    "capture_hint_key",
+                    os.environ.get("SEMBLEND_VLLM_CAPTURE_HINT_KEY", "semblend_capture"),
+                )
+            )
+            .strip()
+            .lower(),
+            capture_write_queue_depth=_read_int(
+                extra,
+                "capture_write_queue_depth",
+                "SEMBLEND_VLLM_CAPTURE_WRITE_QUEUE_DEPTH",
+                64,
+            ),
+            capture_write_close_timeout_s=_read_float(
+                extra,
+                "capture_write_close_timeout_s",
+                "SEMBLEND_VLLM_CAPTURE_WRITE_CLOSE_TIMEOUT_S",
+                5.0,
+            ),
+            donor_registration_retry_steps=_read_int(
+                extra,
+                "donor_registration_retry_steps",
+                "SEMBLEND_VLLM_DONOR_REGISTRATION_RETRY_STEPS",
+                8,
             ),
             kv_storage_backend=str(
                 extra.get(

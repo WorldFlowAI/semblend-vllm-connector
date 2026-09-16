@@ -7,6 +7,8 @@ import itertools
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
@@ -18,6 +20,7 @@ from semblend_vllm_connector._vllm_compat import (
     KVConnectorRole,
     get_virtual_engine,
 )
+from semblend_vllm_connector.capture_writer import LAYER, METADATA, CaptureWriter, WriteJob
 from semblend_vllm_connector.config import SemBlendVllmConfig
 from semblend_vllm_connector.namespace import (
     cache_salt_for_request,
@@ -76,6 +79,34 @@ class _CaptureState:
     block_ids: tuple[list[int], ...]
     namespace: str
     captured_end: int
+
+
+@dataclass(frozen=True)
+class _PendingDonorRegistration:
+    """A finished donor, built and ready to register, and what it is waiting on.
+
+    vLLM frees a request before its id reaches ``finished_req_ids``, so a
+    capture the scheduler has not closed is closed by the worker a step after
+    the registration hook has already run. Rather than decline that donor for
+    good, the registration is built once at finish and held here: the
+    ``Request`` it came from is about to be freed, so nothing here may
+    reference it.
+    """
+
+    donor: DonorRegistration
+    #: The namespace the capture was opened under, which is where its record
+    #: is written and need not be the namespace the donor registers under.
+    capture_namespace: str
+    #: What ``donor_registered`` reports about the boundary slice, carried so
+    #: a retry writes the same row an immediate registration would have.
+    text_offset: int
+    text_chars: int
+    text_fallback: str | None
+    #: The scheduler step this donor started waiting on, so the wait is aged
+    #: against a clock that ticks once per step. Counting calls instead would
+    #: let a batch of concurrent finishes spend one donor's whole budget
+    #: inside a single step, before the worker has had a step to publish in.
+    opened_at_step: int = 0
 
 
 @dataclass(frozen=True)
@@ -148,6 +179,22 @@ def _first_non_empty(*values: Any) -> str | None:
         if text:
             return text
     return None
+
+
+def _hint_is_set(value: Any) -> bool:
+    """Whether a capture hint carried by a request asks for a capture.
+
+    A hint travels as JSON through a gateway, so it arrives as a bool, a
+    number or a string; anything unrecognized is read as "not set" rather than
+    as truthy, so a stray value cannot turn capture on for a whole fleet.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _common_prefix_len(left: list[int], right: list[int]) -> int:
@@ -302,6 +349,74 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # (see _note_capture_cost). Reported once, when the worker sees the
         # request finish, and retired with it.
         self._capture_cost: dict[str, dict[str, float]] = {}
+        # Everything after the per-layer host copy runs on this writer rather
+        # than on the forward-pass thread; started on the first captured layer
+        # so a role that never captures owns no thread. wait_for_save joins it.
+        self._writer: CaptureWriter | None = None
+        # Wall time spent joining the writer inside execute_model, and who had
+        # work in the join that has not been charged for it yet.
+        self._capture_flush_ms: float = 0.0
+        self._capture_flush_participants: set[str] = set()
+        # Guards the donor store against the writer thread: _memory_store, its
+        # LRU eviction, and the staging map below.
+        self._store_lock = threading.RLock()
+        # (storage key, layer) -> the host copy handed to the writer and not
+        # yet durable. A chunked capture reads its own earlier chunk back to
+        # append to it, and those bytes may still be in the queue.
+        self._inflight_layers: dict[tuple[str, str], Any] = {}
+        # What the writer thread has to tell the forward thread. The audit
+        # join key and the main counters are per-request state with no lock on
+        # them, so the writer touches neither: it leaves counts and rows here
+        # and the forward thread drains them at its next join.
+        self._writer_lock = threading.Lock()
+        self._writer_stats: Counter[str] = Counter()
+        self._writer_events: list[tuple[str, dict[str, Any]]] = []
+        self._writer_evicted: list[str] = []
+        self._writer_failed_requests: set[str] = set()
+        # Requests that have already left a queue-full row. The queue fills
+        # for a step, not for a layer, so an 80-layer model would otherwise
+        # write 80 rows about one wait.
+        self._capture_queue_blocked_noted: set[str] = set()
+        # Worker-side: request id -> the namespace its capture was written
+        # under, so a finalize that arrives without a store can still address
+        # the donor. Retired when the worker sees the request finish.
+        self._capture_namespaces: dict[str, str] = {}
+        # Worker-side: donors whose capture is complete and whose metadata
+        # record has been queued, with the length it published. A donor is
+        # finalized once, not once per layer; a capture that later grows
+        # (a readmission) is finalized again at the longer length.
+        self._finalized_donors: dict[str, int] = {}
+        # Worker-side: donors to finalize once this step's layer jobs are in
+        # the queue, so the metadata record never overtakes the tensors.
+        self._finalize_pending: set[str] = set()
+        # Worker-side: requests whose write failed. They never get a metadata
+        # record, so they never become discoverable, and the scheduler role
+        # declines their registration rather than indexing a donor that holds
+        # nothing.
+        self._capture_write_failed: set[str] = set()
+        # Scheduler-side: request id -> the namespace its capture was opened
+        # under. Their registration waits for the capture to be durable, and
+        # the wait has to read the namespace the capture was written under
+        # rather than recompute one: the scheduler hook is handed vLLM's
+        # NewRequestData, which carries no cache_salt, while the finish hook
+        # is handed a Request, which does -- see _register_donor_on_finish.
+        self._captures_opened: dict[str, str] = {}
+        # Scheduler-side: donors whose record had not appeared when their
+        # request finished, kept for a bounded number of steps because the
+        # record routinely lands one step later: vLLM's _free_request calls
+        # request_finished before the id reaches finished_req_ids, so a
+        # capture still open at finish is closed by the worker only after the
+        # next scheduler step ships that id.
+        self._deferred_registrations: dict[str, _PendingDonorRegistration] = {}
+        # Scheduler-side: how many steps this role has built metadata for. The
+        # only clock the deferrals above are aged against, and it ticks in
+        # build_connector_meta alone -- the other hook the retry pass runs
+        # from, request_finished, recurs once per finishing request, so a
+        # batch of finishes is one step no matter how many calls it is.
+        self._scheduler_step: int = 0
+        # Scheduler-side: captures that will receive no further chunk although
+        # no store closed them; handed to the worker in connector metadata.
+        self._pending_finalize: list[str] = []
         # Request id -> the reason its capture was skipped, read at finish by
         # the donor registration. A request with no captured KV cannot supply
         # anything to anyone, so registering it can only take a candidate slot
@@ -534,7 +649,16 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
     @property
     def stats_snapshot(self) -> dict[str, int]:
-        return dict(self._stats)
+        """The forward thread's counters plus the writer thread's own.
+
+        They are kept apart because they are incremented from two threads and
+        a Counter increment is a read-modify-write; merging them here is the
+        only place the two are ever read together.
+        """
+        merged: Counter[str] = Counter(self._stats)
+        with self._writer_lock:
+            merged.update(self._writer_stats)
+        return dict(merged)
 
     def _token_ids(self, request: Any) -> list[int]:
         for attr in ("prompt_token_ids", "all_token_ids", "token_ids"):
@@ -745,14 +869,14 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             self._stats["audit_errors_total"] += 1
             logger.warning("SemBlend audit event write failed", exc_info=True)
 
-    def _routing_metadata(self, request: Any) -> dict[str, str]:
-        """Extract tenant/template routing keys from common vLLM request shapes.
+    def _request_metadata(self, request: Any) -> dict[str, Any]:
+        """The request's metadata and header mappings, under normalized keys.
 
-        Gateways differ in where they place request-scoped metadata. Keep this
-        conservative and canonicalize only the keys Synapse uses for donor reuse
-        policy; unknown metadata stays out of the fleet-routing contract.
+        Gateways differ in where they place request-scoped metadata, so every
+        shape this connector reads is collected once here and lower-cased with
+        dashes folded to underscores; the callers pick the keys they own.
         """
-        mappings: list[Mapping[str, Any]] = []
+        normalized: dict[str, Any] = {}
         for attr in (
             "metadata",
             "request_metadata",
@@ -761,13 +885,20 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             "trace_headers",
         ):
             value = getattr(request, attr, None)
-            if isinstance(value, Mapping):
-                mappings.append(value)
+            if not isinstance(value, Mapping):
+                continue
+            for key, item in value.items():
+                normalized[str(key).lower().replace("-", "_")] = item
+        return normalized
 
-        normalized: dict[str, Any] = {}
-        for mapping in mappings:
-            for key, value in mapping.items():
-                normalized[str(key).lower().replace("-", "_")] = value
+    def _routing_metadata(self, request: Any) -> dict[str, str]:
+        """Extract tenant/template routing keys from common vLLM request shapes.
+
+        Keep this conservative and canonicalize only the keys Synapse uses for
+        donor reuse policy; unknown metadata stays out of the fleet-routing
+        contract.
+        """
+        normalized = self._request_metadata(request)
 
         tenant = _first_non_empty(
             getattr(request, "tenant_id", None),
@@ -806,9 +937,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         return self._donor_dir_for_key(self._storage_key(donor_id, namespace))
 
     def _has_stored_donor(self, donor_id: str, namespace: str) -> bool:
-        if self._storage_key(donor_id, namespace) in self._memory_store:
-            return True
-        return os.path.isdir(self._donor_dir(donor_id, namespace))
+        """Whether this donor is complete enough to be discovered or planned.
+
+        The metadata record is the answer under both backends, because it is
+        written once -- after the writer has landed every layer of the donor.
+        The donor directory is not: it exists from the first layer written
+        into it, so a directory is a capture in progress, and a donor matched
+        off one would be planned against tensors that are still queued.
+        """
+        return os.path.isfile(self._donor_metadata_path(donor_id, namespace))
 
     def _materialization_enabled(self) -> bool:
         if self._compat_decline is not None:
@@ -1112,11 +1249,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
     def _stored_donor_token_count(self, donor_id: str, namespace: str) -> int:
         storage_key = self._storage_key(donor_id, namespace)
-        entry = self._memory_store.get(storage_key)
-        if entry is not None:
-            # A read is a use: without it the cap evicts in arrival order.
-            self._memory_store.move_to_end(storage_key)
-            return int(entry.get("__token_count__", 0))
+        with self._store_lock:
+            entry = self._memory_store.get(storage_key)
+            if entry is not None:
+                # A read is a use: without it the cap evicts in arrival order.
+                self._memory_store.move_to_end(storage_key)
+                return int(entry.get("__token_count__", 0))
         try:
             with open(self._donor_metadata_path(donor_id, namespace), encoding="utf-8") as f:
                 metadata = json.load(f)
@@ -2223,7 +2361,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             self._note_capture_disabled()
             return []
         for finished_id in getattr(scheduler_output, "finished_req_ids", None) or ():
-            self._capture_state.pop(str(finished_id), None)
+            if self._capture_state.pop(str(finished_id), None) is not None:
+                # It finished mid-capture, so no store will ever close it;
+                # the worker publishes what it holds instead.
+                self._pending_finalize.append(str(finished_id))
+            self._captures_opened.pop(str(finished_id), None)
             # request_finished has already read and retired these; the pops are
             # here so an engine that never calls it leaks nothing.
             self._capture_skipped_reasons.pop(str(finished_id), None)
@@ -2262,6 +2404,20 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     "served_request",
                     phase="admitted",
                     prompt_tokens=len(token_ids),
+                )
+                continue
+            # Taken after the served check so that check keeps consuming the
+            # served set, and once per request: a request the policy declines
+            # opens no capture, so its continuations find no state and never
+            # reach here again.
+            policy_reason = self._capture_policy_decline(new_req, request_id)
+            if policy_reason is not None:
+                self._note_capture_skipped(
+                    request_id,
+                    policy_reason,
+                    prompt_tokens=len(token_ids),
+                    capture_policy=self._config.capture_policy,
+                    capture_sample_rate=float(self._config.capture_sample_rate),
                 )
                 continue
             block_ids = _normalize_block_ids(getattr(new_req, "block_ids", None))
@@ -2342,6 +2498,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     prompt_tokens=len(state.token_ids),
                 )
                 self._capture_state.pop(request_id, None)
+                # No store will mark this donor final, so the worker is told
+                # to publish the shorter donor it already holds.
+                self._pending_finalize.append(request_id)
                 continue
             block_ids = self._extend_block_table(
                 state.block_ids,
@@ -2357,6 +2516,54 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             if store is not None:
                 stores.append(store)
         return stores
+
+    def _capture_policy_decline(self, request: Any, request_id: str) -> str | None:
+        """The skip reason this request's capture policy gives it, or None.
+
+        ``all`` decides nothing, which is what keeps it byte-for-byte the
+        selection every earlier release made: the gate returns None before it
+        reads anything about the request.
+        """
+        policy = self._config.capture_policy
+        if policy == "sampled":
+            return None if self._sampled_for_capture(request_id) else "not_sampled"
+        if policy == "hinted":
+            return None if self._capture_hinted(request) else "not_hinted"
+        return None
+
+    def _sampled_for_capture(self, request_id: str) -> bool:
+        """Whether this request is in the sampled fraction.
+
+        Keyed on the request id alone, so the set is a property of the trace
+        and not of arrival order: a rerun of the same requests captures the
+        same donors, which is what makes a sampled arm comparable with itself.
+        """
+        rate = float(self._config.capture_sample_rate)
+        if rate >= 1.0:
+            return True
+        if rate <= 0.0:
+            return False
+        digest = hashlib.sha256(request_id.encode("utf-8")).digest()[:8]
+        return int.from_bytes(digest, "big") < rate * float(1 << 64)
+
+    def _capture_hinted(self, request: Any) -> bool:
+        """Whether the caller marked this request as a donor worth capturing.
+
+        Read from the places a router can reach: the request's sampling-params
+        ``extra_args`` (vLLM's OpenAI server forwards ``vllm_xargs`` into it),
+        the request metadata and header mappings the routing keys come from
+        -- under the bare key and the ``x-`` prefixed spelling -- and an
+        attribute of that name on the request object itself.
+        """
+        key = self._config.capture_hint_key
+        candidates = [getattr(request, key, None)]
+        extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", None)
+        if isinstance(extra_args, Mapping):
+            candidates.append(extra_args.get(key))
+        normalized = self._request_metadata(request)
+        candidates.append(normalized.get(key))
+        candidates.append(normalized.get(f"x_{key}"))
+        return any(_hint_is_set(value) for value in candidates)
 
     def _capture_allowed(self, request_id: str) -> bool:
         """Whether a request served by this connector may be captured too.
@@ -2437,10 +2644,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # Nothing new is block-complete yet; keep the running table.
             self._capture_state[request_id] = state
             return None
-        if end >= prompt_cap:
+        final = end >= prompt_cap
+        if final:
             self._capture_state.pop(request_id, None)
         else:
             self._capture_state[request_id] = replace(state, captured_end=end)
+        # This request now has a write on the way that its registration has to
+        # wait for, under this capture's own namespace; see
+        # _register_donor_on_finish.
+        self._captures_opened[request_id] = state.namespace
         # This request now has KV of its own on the way, so an earlier skip is
         # no longer what its capture ended on and must not block its
         # registration. A skip recorded *after* this one still does: a
@@ -2453,11 +2665,17 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             token_count=end,
             namespace=state.namespace,
             block_ids=state.block_ids,
+            final=final,
         )
 
     def build_connector_meta(
         self, scheduler_output: "SchedulerOutput"
     ) -> SemBlendConnectorMetadata:
+        # First, because this is the scheduler's once-per-step hook and the
+        # donors held here are waiting on a record the worker publishes
+        # between steps. The tick is here and nowhere else: this is the step.
+        self._scheduler_step += 1
+        self._retry_deferred_registrations()
         loads: list[PendingLoad] = []
         for load in self._pending_loads.values():
             if load.block_ids is None:
@@ -2475,7 +2693,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         stores = self._build_store_metadata(scheduler_output)
         self._track_running_fills(scheduler_output)
         self._pending_loads.clear()
-        return SemBlendConnectorMetadata(loads=loads, stores=stores)
+        # Drained after the stores are built: both are filled by the same
+        # pass, and a finalize left behind would publish one step late.
+        finalize, self._pending_finalize = self._pending_finalize, []
+        return SemBlendConnectorMetadata(loads=loads, stores=stores, finalize=finalize)
 
     def _track_running_fills(self, scheduler_output: "SchedulerOutput") -> None:
         """Keep acting on a served request's blocks as it fills more of them.
@@ -2713,10 +2934,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # exact-prefix path sets both to the local prefix-cache boundary.
             donor_start = load.donor_start or 0
             storage_key = self._storage_key(load.donor_id, load.namespace)
-            entry = self._memory_store.get(storage_key)
-            if entry is not None:
-                # A load is a use: without it the cap evicts in arrival order.
-                self._memory_store.move_to_end(storage_key)
+            with self._store_lock:
+                entry = self._memory_store.get(storage_key)
+                if entry is not None:
+                    # A load is a use: without it the cap evicts in arrival
+                    # order.
+                    self._memory_store.move_to_end(storage_key)
             for layer_name, dst_kv_cache_layer in self._iter_kv_layers(forward_context):
                 layer_metadata = self._layer_attn_metadata(attn_metadata, layer_name)
                 if layer_metadata is None:
@@ -2732,10 +2955,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     filename = self._layer_filename(load.donor_id, load.namespace, layer_name)
                     try:
                         tensors = load_file(filename)
-                    except OSError:
-                        # Evicted (or never fully captured) between the
-                        # scheduler's advertise and this load. Whole donors
-                        # go, not layers, so one miss decides the load.
+                    except Exception:
+                        # Evicted, never fully captured, or left unparseable
+                        # by a write that failed part-way -- safetensors
+                        # raises its own error type for that last one, and it
+                        # would otherwise escape into the forward pass. Whole
+                        # donors go, not layers, so one miss decides the load.
                         donor_gone = True
                         break
                     src_kv_cache = tensors["kv_cache"].to(dst_kv_cache_layer.device)
@@ -2882,6 +3107,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     metadata_type=type(metadata).__name__,
                 )
             return
+        # Ahead of the store list, and not behind its emptiness check: a step
+        # can carry a finalize for a capture that sent no chunk of its own.
+        for request_id in metadata.finalize:
+            self._queue_finalize(str(request_id))
         if not metadata.stores:
             return
 
@@ -2895,6 +3124,8 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 )
                 continue
             self._capture_layer(store, layer_name, kv_layer, attn_metadata)
+            if store.final:
+                self._queue_finalize(store.request_id)
 
     def _capture_layer(
         self, store: PendingStore, layer_name: str, kv_layer: Any, attn_metadata: Any
@@ -2937,8 +3168,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             host_kv = torch.cat((base, host_kv), dim=0 if host_kv.dim() == 2 else 1)
         actual_token_count = start + int(slot_mapping.numel())
         write_started = time.monotonic()
-        self._write_captured_layer(store, layer_name, host_kv, actual_token_count)
+        self._submit_captured_layer(store, layer_name, host_kv, actual_token_count)
+        # What the write costs the forward pass, which is now the handoff and
+        # nothing else unless the writer's queue was full.
         write_ms = (time.monotonic() - write_started) * 1000.0
+        self._capture_namespaces[store.request_id] = store.namespace
         self._capture_progress[store.request_id] = {**progress, layer_name: actual_token_count}
         self._note_capture_cost(
             store.request_id,
@@ -2965,16 +3199,36 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         than emitted per layer because a model has one of these per layer per
         chunk and the audit would otherwise be mostly capture rows; the
         request's total is written once, when the worker sees it finish.
+
+        ``write_ms`` keeps its meaning -- what the write cost the forward pass
+        -- and not its old content: the write itself now runs on the capture
+        writer, so what is left on this thread is the handoff, plus whatever
+        the queue-full wait added (``write_blocked_ms``, a subset of it). The
+        rest of the write is not free, only overlapped: whatever the writer
+        has not finished when the step ends is paid at the join in
+        ``wait_for_save``, which vLLM also calls inside ``execute_model``, and
+        that is ``flush_ms``. Read the two together.
         """
-        running = self._capture_cost.get(request_id)
-        if running is None:
-            running = {"capture_ms": 0.0, "copy_ms": 0.0, "write_ms": 0.0, "copy_bytes": 0.0}
-            self._capture_cost[request_id] = running
+        running = self._running_capture_cost(request_id)
         running["capture_ms"] += capture_ms
         running["copy_ms"] += copy_ms
         running["write_ms"] += write_ms
         running["copy_bytes"] += float(copy_bytes)
         self._stats["capture_layers_total"] += 1
+
+    def _running_capture_cost(self, request_id: str) -> dict[str, float]:
+        running = self._capture_cost.get(request_id)
+        if running is None:
+            running = {
+                "capture_ms": 0.0,
+                "copy_ms": 0.0,
+                "write_ms": 0.0,
+                "write_blocked_ms": 0.0,
+                "flush_ms": 0.0,
+                "copy_bytes": 0.0,
+            }
+            self._capture_cost[request_id] = running
+        return running
 
     def _report_capture_cost(self, request_id: str) -> None:
         """Write this request's capture cost once, on the worker's finish hook.
@@ -2989,10 +3243,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         capture_ms = int(round(running["capture_ms"]))
         copy_ms = int(round(running["copy_ms"]))
         write_ms = int(round(running["write_ms"]))
+        write_blocked_ms = int(round(running.get("write_blocked_ms", 0.0)))
+        flush_ms = int(round(running.get("flush_ms", 0.0)))
         copy_bytes = int(running["copy_bytes"])
         self._stats["capture_ms_total"] += capture_ms
         self._stats["capture_copy_ms_total"] += copy_ms
         self._stats["capture_write_ms_total"] += write_ms
+        self._stats["capture_write_blocked_ms_total"] += write_blocked_ms
         self._stats["capture_bytes_total"] += copy_bytes
         self._audit_event(
             "donor_capture_cost",
@@ -3000,6 +3257,8 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             capture_ms=capture_ms,
             copy_ms=copy_ms,
             write_ms=write_ms,
+            write_blocked_ms=write_blocked_ms,
+            flush_ms=flush_ms,
             copy_bytes=copy_bytes,
             layers=len(self._capture_progress.get(request_id, {})),
             store_tier=self._config.kv_storage_backend,
@@ -3026,72 +3285,391 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         )
 
     def _captured_layer(self, store: PendingStore, layer_name: str) -> Any | None:
-        """This donor's stored copy of one layer, or None when there is none."""
-        if self._config.kv_storage_backend == "memory":
-            entry = self._memory_store.get(self._storage_key(store.request_id, store.namespace))
-            return None if entry is None else entry.get(layer_name)
+        """This donor's stored copy of one layer, or None when there is none.
+
+        The staging map is consulted first because a layer handed to the
+        writer is this donor's copy whether or not the writer has reached it
+        yet: a chunked capture appends to what the previous chunk produced,
+        not to what happens to be on disk.
+        """
+        if store.request_id in self._capture_write_failed:
+            # A write of this capture failed, so what is on the store may be
+            # a file that was truncated part-way rather than this donor's
+            # earlier chunk. Restart from 0 instead of reading it back.
+            return None
+        storage_key = self._storage_key(store.request_id, store.namespace)
+        with self._store_lock:
+            staged = self._inflight_layers.get((storage_key, layer_name))
+            if staged is not None:
+                return staged
+            if self._config.kv_storage_backend == "memory":
+                entry = self._memory_store.get(storage_key)
+                return None if entry is None else entry.get(layer_name)
         from safetensors.torch import load_file
 
         try:
             tensors = load_file(self._layer_filename(store.request_id, store.namespace, layer_name))
-        except OSError:
+        except Exception:
+            # Not only "no such file": a write that failed part-way (the
+            # store filled up) leaves a file safetensors refuses to parse,
+            # and it raises its own error type for that. Unreadable and
+            # absent mean the same thing here -- this chunk restarts from 0
+            # -- and neither may escape into the forward pass.
             return None
         return tensors["kv_cache"]
 
-    def _write_captured_layer(
+    # ---------------------------------------------------------------- writer
+
+    def _ensure_writer(self) -> CaptureWriter:
+        """The connector's writer thread, started at the first captured layer."""
+        if self._writer is None:
+            self._writer = CaptureWriter(
+                write=self._run_write_job,
+                on_error=self._record_write_error,
+                on_blocked=self._note_write_queue_blocked,
+                max_queue_depth=int(self._config.capture_write_queue_depth),
+                close_timeout=float(self._config.capture_write_close_timeout_s),
+                thread_name=f"semblend-capture-writer-{self._connector_id}",
+            )
+        return self._writer
+
+    def _submit_captured_layer(
         self, store: PendingStore, layer_name: str, host_kv: Any, token_count: int
     ) -> None:
-        donor_dir = self._donor_dir(store.request_id, store.namespace)
-        os.makedirs(donor_dir, exist_ok=True)
-        # The scheduler-role connector runs in another process and reads
-        # the captured length from this file for both backends.
-        with open(
-            self._donor_metadata_path(store.request_id, store.namespace), "w", encoding="utf-8"
-        ) as f:
-            json.dump({"token_count": token_count}, f)
+        """Hand one layer's host copy to the writer and return to the forward pass."""
+        storage_key = self._storage_key(store.request_id, store.namespace)
+        with self._store_lock:
+            self._inflight_layers[(storage_key, layer_name)] = host_kv
+        self._submit_write(
+            WriteJob(
+                request_id=store.request_id,
+                namespace=store.namespace,
+                kind=LAYER,
+                layer_name=layer_name,
+                payload=host_kv,
+                token_count=int(token_count),
+            )
+        )
+
+    def _submit_write(self, job: WriteJob, *, timeout: float | None = None) -> None:
+        # Whoever has work in the queue pays for the join that drains it.
+        self._capture_flush_participants.add(job.request_id)
+        try:
+            self._ensure_writer().submit(job, timeout=timeout)
+        except (RuntimeError, queue.Full) as exc:
+            # The writer is shut down (interpreter teardown, or a second save
+            # after shutdown), or teardown would not wait any longer for a
+            # queue nothing is draining: the bytes are not going to land, and
+            # a dropped write must never pass for a written one.
+            self._record_write_error(job, exc)
+            self._drain_writer_reports()
+
+    def _run_write_job(self, job: WriteJob) -> None:
+        """Execute one queued job. Writer thread; raises on failure."""
+        if job.kind == METADATA:
+            self._write_donor_metadata(job)
+            return
+        self._write_captured_layer(job)
+
+    def _write_captured_layer(self, job: WriteJob) -> None:
+        """Land one layer in the configured store. Writer thread.
+
+        No metadata record is written here. The record is the donor's
+        visibility, and a donor with one layer on disk is not yet a donor.
+        """
+        storage_key = self._storage_key(job.request_id, job.namespace)
+        layer_name = str(job.layer_name)
         if self._config.kv_storage_backend == "memory":
-            key = self._storage_key(store.request_id, store.namespace)
-            entry = self._memory_store.get(key)
-            if entry is None:
-                entry = {"__token_count__": token_count, "__request_id__": store.request_id}
-                self._memory_store[key] = entry
-                while len(self._memory_store) > max(1, self._config.kv_memory_max_donors):
-                    self._evict_memory_donor()
-            else:
-                entry["__token_count__"] = token_count
-                self._memory_store.move_to_end(key)
-            entry[layer_name] = host_kv
+            with self._store_lock:
+                entry = self._memory_store.get(storage_key)
+                if entry is None:
+                    entry = {
+                        "__token_count__": job.token_count,
+                        "__request_id__": job.request_id,
+                    }
+                    self._memory_store[storage_key] = entry
+                    while len(self._memory_store) > max(1, self._config.kv_memory_max_donors):
+                        self._evict_memory_donor()
+                else:
+                    entry["__token_count__"] = job.token_count
+                    self._memory_store.move_to_end(storage_key)
+                entry[layer_name] = job.payload
+                self._inflight_layers.pop((storage_key, layer_name), None)
+            self._writer_count("capture_layer_writes_total")
             return
         from safetensors.torch import save_file
 
-        save_file(
-            {"kv_cache": host_kv},
-            self._layer_filename(store.request_id, store.namespace, layer_name),
+        donor_dir = self._donor_dir_for_key(storage_key)
+        os.makedirs(donor_dir, exist_ok=True)
+        save_file({"kv_cache": job.payload}, os.path.join(donor_dir, f"{layer_name}.safetensors"))
+        with self._store_lock:
+            self._inflight_layers.pop((storage_key, layer_name), None)
+        self._writer_count("capture_layer_writes_total")
+
+    def _write_donor_metadata(self, job: WriteJob) -> None:
+        """Publish one complete donor. Writer thread.
+
+        This is the last job a donor's capture produces and the point the
+        donor becomes discoverable: the scheduler role, in another process,
+        reads this file for the length it sizes spans against, and
+        ``_has_stored_donor`` reads its presence as "this donor is readable".
+        It is written through a temporary file so a reader never sees half a
+        record, and it is written once per donor rather than once per layer.
+
+        The layers it vouches for are checked again here, immediately before
+        it is published, and a missing one fails the publish rather than
+        advertising a donor with a hole in it. Nothing in this process should
+        be able to remove them -- the writer owns a capture until it has
+        drained -- so this is the backstop for everything that is not this
+        process: an operator clearing the volume, a stale role, a store that
+        dropped a file. An unpublished donor is a lost donor; a published one
+        with a layer missing fails a load inside a later forward pass.
+        """
+        storage_key = self._storage_key(job.request_id, job.namespace)
+        donor_dir = self._donor_dir_for_key(storage_key)
+        if self._config.kv_storage_backend == "memory":
+            with self._store_lock:
+                entry = self._memory_store.get(storage_key)
+                if entry is None:
+                    # Evicted while its own record was queued behind it.
+                    # Publishing now would advertise tensors that are gone.
+                    self._writer_count("capture_metadata_skipped_evicted")
+                    return
+                missing = [name for name in job.layer_names if name not in entry]
+        else:
+            missing = [
+                name
+                for name in job.layer_names
+                if not os.path.isfile(os.path.join(donor_dir, f"{name}.safetensors"))
+            ]
+        if missing:
+            # Name only: this is a layer of a model, not anything the request
+            # carried.
+            raise FileNotFoundError(
+                f"refusing to publish a donor record: {len(missing)} captured layer(s) "
+                f"are gone from the store, first {missing[0]}"
+            )
+        os.makedirs(donor_dir, exist_ok=True)
+        path = os.path.join(donor_dir, _DONOR_METADATA_FILENAME)
+        temporary = f"{path}.tmp-{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump({"token_count": int(job.token_count)}, f)
+        os.replace(temporary, path)
+        self._writer_count("capture_metadata_writes_total")
+
+    def _queue_finalize(self, request_id: str) -> None:
+        """Mark a donor for publication once this step's layers are queued.
+
+        Deferred to the join rather than done here so the record cannot
+        overtake the tensors it describes: ``wait_for_save`` submits it after
+        every layer job of the step is already in the queue.
+        """
+        if request_id in self._capture_write_failed:
+            return
+        progress = self._capture_progress.get(request_id)
+        if not progress:
+            return
+        # The donor's guaranteed length is its shortest layer: a load reads
+        # every layer, so a record longer than one of them promises tokens
+        # that layer does not hold.
+        token_count = min(progress.values())
+        if self._finalized_donors.get(request_id) == token_count:
+            return
+        # Any change republishes, not only growth: a capture that lost its
+        # earlier chunks and restarted from 0 is shorter than the record
+        # already on the store, and a record longer than the bytes is the
+        # failure this ordering exists to prevent.
+        self._finalize_pending.add(request_id)
+
+    def _submit_pending_finalizes(self, *, deadline: float | None = None) -> None:
+        """Queue the records of the donors this step completed.
+
+        ``deadline`` bounds the queueing, for teardown: a full queue there
+        means the store has wedged, and waiting on it is the one thing that
+        can keep a process from exiting.
+        """
+        # Sorted so a step that completes several donors queues them in an
+        # order a reader can reproduce.
+        for request_id in sorted(self._finalize_pending):
+            namespace = self._capture_namespaces.get(request_id)
+            progress = self._capture_progress.get(request_id)
+            if namespace is None or not progress:
+                continue
+            if request_id in self._capture_write_failed:
+                # A layer of this donor did not land. Publishing it now would
+                # advertise a length behind bytes that are not there.
+                self._stats["capture_finalize_skipped_write_failed"] += 1
+                continue
+            token_count = min(progress.values())
+            self._finalized_donors[request_id] = token_count
+            self._submit_write(
+                WriteJob(
+                    request_id=request_id,
+                    namespace=namespace,
+                    kind=METADATA,
+                    token_count=token_count,
+                    # What this record is about to vouch for, checked again by
+                    # the writer immediately before it publishes.
+                    layer_names=tuple(sorted(progress)),
+                ),
+                timeout=None if deadline is None else max(0.0, deadline - time.monotonic()),
+            )
+        self._finalize_pending.clear()
+
+    def _flush_captures(self) -> None:
+        """Wait for this step's layers, then publish the donors they complete.
+
+        The two joins are the ordering, and they are in this order on purpose.
+        The first one lets every layer of the step land -- or fail, which is
+        why the writer's reports are drained between them: a donor with a
+        failed layer must not be published at all. Only then is the metadata
+        record queued, so it can neither overtake the tensors nor outlive
+        their failure.
+
+        This runs on the forward-pass thread inside ``execute_model``, so it
+        is timed: what the writer did not overlap with the rest of the step is
+        paid here, and it is the one part of the write cost that did not move
+        off the critical path. Deferring the write turns a serial per-layer
+        cost into a pipelined one; it does not remove it, and an operator
+        comparing a capture before and after this change has to read
+        ``capture_ms`` and ``capture_flush_ms`` together.
+
+        After ``shutdown`` there is nothing here to wait for: the writer is
+        closed, anything teardown abandoned is already a counted failure, and
+        this step's own submissions fail the same way. vLLM calls this hook
+        after every ``save_kv_layer``, teardown or no teardown, so it has to
+        return there rather than join work nobody is going to run.
+        """
+        started = time.monotonic()
+        writer = self._writer
+        if writer is not None:
+            writer.join()
+        self._drain_writer_reports()
+        self._submit_pending_finalizes()
+        if writer is not None:
+            writer.join()
+        self._drain_writer_reports()
+        self._note_flush_cost((time.monotonic() - started) * 1000.0)
+
+    def _note_flush_cost(self, flush_ms: float) -> None:
+        """Charge this step's join to the connector and to who was in it.
+
+        The join is per step, not per request, so every request whose layers
+        were in it reports the same wall time: what it cost the step they
+        shared, not a share of it. The connector-level total is the
+        unduplicated one -- it is added once per join.
+        """
+        self._capture_flush_ms += flush_ms
+        self._stats["capture_flush_ms_total"] = int(round(self._capture_flush_ms))
+        participants, self._capture_flush_participants = self._capture_flush_participants, set()
+        for request_id in participants:
+            self._running_capture_cost(request_id)["flush_ms"] += flush_ms
+
+    def _writer_count(self, name: str, amount: int = 1) -> None:
+        """Count something the writer thread did, for the forward thread."""
+        with self._writer_lock:
+            self._writer_stats[name] += amount
+
+    def _note_write_queue_blocked(self, job: WriteJob, blocked_ms: float) -> None:
+        """The writer's queue was full and the forward pass waited for it.
+
+        Submitting thread, so the counters and the audit are this thread's.
+        Nothing was dropped -- a dropped layer would leave a donor advertising
+        bytes nobody wrote -- so the cost lands on the request that paid it.
+        """
+        self._stats["capture_write_queue_blocked_total"] += 1
+        self._running_capture_cost(job.request_id)["write_blocked_ms"] += blocked_ms
+        if job.request_id in self._capture_queue_blocked_noted:
+            return
+        self._capture_queue_blocked_noted.add(job.request_id)
+        self._audit_event(
+            "capture_write_queue_full",
+            request_id=job.request_id,
+            blocked_ms=int(round(blocked_ms)),
+            queue_depth=int(self._config.capture_write_queue_depth),
+            store_tier=self._config.kv_storage_backend,
         )
+
+    def _record_write_error(self, job: WriteJob | None, exc: BaseException) -> None:
+        """A queued write failed. Writer thread (or the submitter on refusal).
+
+        The donor is marked so no metadata record is ever written for it: it
+        stays undiscoverable, and the scheduler role declines its registration
+        with a reason instead of indexing a donor whose bytes never landed.
+        The row itself is left for the forward thread, which owns the audit.
+        """
+        if job is None:
+            return
+        with self._writer_lock:
+            self._writer_stats["capture_write_errors_total"] += 1
+            self._writer_events.append(
+                (
+                    "donor_capture_write_failed",
+                    {
+                        "request_id": job.request_id,
+                        "kind": job.kind,
+                        "layer": job.layer_name,
+                        # Type only: a store's message can carry a path or a
+                        # payload detail.
+                        "error_type": type(exc).__name__,
+                        "store_tier": self._config.kv_storage_backend,
+                    },
+                )
+            )
+            self._writer_failed_requests.add(job.request_id)
+        if job.layer_name is not None:
+            storage_key = self._storage_key(job.request_id, job.namespace)
+            with self._store_lock:
+                # Not written, so it must not pass for this donor's copy on
+                # the next chunk; that chunk restarts from 0 instead.
+                self._inflight_layers.pop((storage_key, job.layer_name), None)
+        logger.warning(
+            "SemBlend donor capture write failed request_id=%s kind=%s",
+            job.request_id,
+            job.kind,
+            exc_info=exc,
+        )
+
+    def _drain_writer_reports(self) -> None:
+        """Move the writer thread's rows and evictions onto this thread."""
+        with self._writer_lock:
+            events, self._writer_events = self._writer_events, []
+            failed, self._writer_failed_requests = self._writer_failed_requests, set()
+            evicted, self._writer_evicted = self._writer_evicted, []
+        self._capture_write_failed |= failed
+        for request_id in evicted:
+            self._capture_progress.pop(request_id, None)
+            # Its record was retracted with it, so the donor is unpublished:
+            # a later chunk has to be able to publish it again.
+            self._finalized_donors.pop(request_id, None)
+            # The next chunk of an evicted donor finds no base by
+            # construction, and that restart is its own event: forget that
+            # this request was already reported so the eviction's consequence
+            # is not deduped away.
+            self._capture_base_missing_noted.pop(request_id, None)
+        for event, fields in events:
+            self._audit_event(event, **fields)
 
     def _evict_memory_donor(self) -> None:
         """Drop the least recently used donor and retract its advertised length.
 
-        metadata.json is what the scheduler role sizes spans against, so left
-        behind it advertises tensors that no longer exist and the worker then
-        fails the load. The directory goes too: _has_stored_donor reads its
-        presence as "captured".
+        Writer thread, under ``_store_lock``. metadata.json is what the
+        scheduler role sizes spans against, so left behind it advertises
+        tensors that no longer exist and the worker then fails the load. The
+        directory goes too: a donor's files must not outlive its record.
         """
         storage_key, entry = self._memory_store.popitem(last=False)
-        self._stats["memory_store_evictions"] += 1
+        self._writer_count("memory_store_evictions")
         evicted_request_id = str(entry.get("__request_id__", ""))
-        self._capture_progress.pop(evicted_request_id, None)
-        # The next chunk of an evicted donor finds no base by construction, and
-        # that restart is its own event: forget that this request was already
-        # reported so the eviction's consequence is not deduped away.
-        self._capture_base_missing_noted.pop(evicted_request_id, None)
+        with self._writer_lock:
+            self._writer_evicted.append(evicted_request_id)
         donor_dir = self._donor_dir_for_key(storage_key)
         try:
             os.remove(os.path.join(donor_dir, _DONOR_METADATA_FILENAME))
         except FileNotFoundError:
             pass
         except OSError:
-            self._stats["memory_store_eviction_retract_errors"] += 1
+            self._writer_count("memory_store_eviction_retract_errors")
             logger.warning("SemBlend evicted-donor metadata removal failed", exc_info=True)
             return
         try:
@@ -3101,7 +3679,15 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             pass
 
     def wait_for_save(self) -> None:
-        return
+        """Join the writer: everything this forward pass queued is durable.
+
+        vLLM calls this at the end of the step whose ``save_kv_layer`` calls
+        queued the work, so it is both the join the interface documents and
+        the point a donor completed in this step is published -- its metadata
+        record is submitted here, behind every layer job of the step, and the
+        queue has one consumer, so the record lands last.
+        """
+        self._flush_captures()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         # Worker side. A finished request sends no more prefill chunks, so
@@ -3113,10 +3699,26 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # is the one event the worker writes here, and it is written before
         # the key it joins on is retired.
         for request_id in finished_req_ids or ():
+            # Backstop for an engine whose last capture chunk was never
+            # closed by a store and never named in a finalize: the donor is
+            # published at the length the worker actually holds, or not at
+            # all, but never left half-visible.
+            self._queue_finalize(str(request_id))
+        self._flush_captures()
+        for request_id in finished_req_ids or ():
             self._report_capture_cost(str(request_id))
+            # After the join above, so "this capture has no record" is final
+            # rather than "the writer has not got to it yet".
+            self._discard_unpublished_capture(
+                str(request_id), self._capture_namespaces.get(str(request_id), "")
+            )
             self._capture_progress.pop(str(request_id), None)
             self._capture_base_missing_noted.pop(str(request_id), None)
             self._capture_skipped_reasons.pop(str(request_id), None)
+            self._capture_namespaces.pop(str(request_id), None)
+            self._finalized_donors.pop(str(request_id), None)
+            self._capture_write_failed.discard(str(request_id))
+            self._capture_queue_blocked_noted.discard(str(request_id))
             self._forget_request_join_key(str(request_id))
         return None, None
 
@@ -3142,6 +3744,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         request: "Request",
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
+        # Other donors first: the worker has been publishing since the last
+        # step, and this hook recurs whether or not a step is built.
+        self._retry_deferred_registrations()
         request_id = self._request_id(request)
         self._lookup_cache.pop(request_id, None)
         self._load_plans.pop(request_id, None)
@@ -3160,6 +3765,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # request ids, so a reason left behind would decide the next use.
             self._capture_skipped_reasons.pop(request_id, None)
             self._capture_boundaries.pop(request_id, None)
+            self._captures_opened.pop(request_id, None)
             # Last, so the join key outlives every event this finish emits.
             self._forget_request_join_key(request_id)
         return False, None
@@ -3244,9 +3850,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         ) = self._boundary_sliced_text(
             request, token_ids, int(self._capture_boundaries.get(request_id, 0)), kind="donor"
         )
-        try:
-            donor = DonorRegistration(
-                donor_id=self._request_id(request),
+        capture_namespace = self._captures_opened.get(request_id)
+        pending = _PendingDonorRegistration(
+            donor=DonorRegistration(
+                donor_id=request_id,
                 token_ids=token_ids,
                 prompt_text=donor_text,
                 model_id=model_id_from_config(self._config, self._vllm_config),
@@ -3260,19 +3867,181 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     "num_blocks": len(block_ids),
                     **self._routing_metadata(request),
                 },
-            )
+            ),
+            # The capture's own namespace, not the donor's. The scheduler hook
+            # that opened the capture is handed vLLM's NewRequestData, which
+            # has no cache_salt field, while this hook is handed a Request,
+            # which does, and the namespace digest folds the salt in. Checking
+            # the record under the donor's namespace would stat a directory
+            # the worker never writes to, and every salted request would be
+            # declined forever with its bytes on disk under the other digest.
+            capture_namespace=capture_namespace or "",
+            text_offset=int(donor_text_offset),
+            text_chars=int(donor_text_chars),
+            text_fallback=donor_text_fallback,
+        )
+        if capture_namespace is not None and not self._has_stored_donor(
+            request_id, capture_namespace
+        ):
+            self._defer_donor_registration(pending)
+            return
+        self._register_pending_donor(pending)
+
+    def _defer_donor_registration(self, pending: _PendingDonorRegistration) -> None:
+        """Hold a donor whose capture is not readable yet, and say so.
+
+        THE ORDERING INVARIANT. A capture is written off the forward thread,
+        so between the last chunk and this hook the donor's bytes may still be
+        queued -- or may have failed to land at all. Registering here would put
+        a donor in the provider's index that a later request can match and then
+        load garbage from, or not find. The metadata record is written last,
+        after every layer, so its absence means "not readable yet".
+
+        Not readable yet is usually not "never": vLLM's ``_free_request`` calls
+        ``request_finished`` and only then adds the id to ``finished_req_ids``,
+        which ships in the *next* SchedulerOutput, so a capture still open at
+        finish is closed by the worker one step after this hook ran. The donor
+        is therefore retried for a bounded number of scheduler steps rather
+        than declined on the spot, and only a record that never appears is a
+        decline. The worker writes `donor_capture_write_failed` for the failure
+        case; join the two on request_id.
+        """
+        request_id = pending.donor.donor_id
+        if int(self._config.donor_registration_retry_steps) <= 0:
+            self._decline_undurable_donor(pending, waited=0)
+            return
+        self._deferred_registrations[request_id] = replace(
+            pending, opened_at_step=self._scheduler_step
+        )
+        self._stats["donor_registration_deferred_total"] += 1
+        self._audit_event(
+            "donor_registration_deferred",
+            request_id=request_id,
+            reason="capture_not_durable",
+            prompt_tokens=len(pending.donor.token_ids),
+            retry_steps=int(self._config.donor_registration_retry_steps),
+            store_tier=self._config.kv_storage_backend,
+        )
+
+    def _retry_deferred_registrations(self, *, final: bool = False) -> None:
+        """Register the held donors whose record has since appeared.
+
+        Called from every scheduler-role hook that recurs -- the per-step
+        metadata build, and each request's finish -- because the worker
+        publishes between them, and once more at ``shutdown``. ``final`` is
+        that last pass: nothing will run after it, so a record that is still
+        missing is missing for good and the donor is declined rather than left
+        held.
+
+        Every call registers whatever has landed; only the step clock ages
+        anyone. A finish is not a step -- vLLM frees a whole batch of requests
+        between two of them -- so aging here would let one busy step spend
+        every held donor's budget before the worker had a step to publish in.
+        """
+        budget = int(self._config.donor_registration_retry_steps)
+        for request_id, pending in list(self._deferred_registrations.items()):
+            waited = max(0, self._scheduler_step - int(pending.opened_at_step))
+            if self._has_stored_donor(request_id, pending.capture_namespace):
+                del self._deferred_registrations[request_id]
+                self._register_pending_donor(pending, waited=waited)
+                continue
+            if waited < budget and not final:
+                continue
+            del self._deferred_registrations[request_id]
+            self._decline_undurable_donor(pending, waited=waited)
+
+    def _decline_undurable_donor(self, pending: _PendingDonorRegistration, *, waited: int) -> None:
+        """Give up on a donor whose record never appeared.
+
+        The bytes are left where they are. They belong to the worker role,
+        which is another process with a write queue this one cannot see, so
+        "no record" here means "no record yet, as far as the scheduler can
+        tell" and never "no record is coming". The worker deletes what it
+        never published, at the point its own writer has drained -- see
+        ``_discard_unpublished_capture``.
+        """
+        request_id = pending.donor.donor_id
+        self._stats["donor_registration_skipped_not_durable"] += 1
+        self._audit_event(
+            "donor_registration_skipped",
+            request_id=request_id,
+            reason="capture_not_durable",
+            prompt_tokens=len(pending.donor.token_ids),
+            steps_waited=int(waited),
+            store_tier=self._config.kv_storage_backend,
+        )
+
+    def _discard_unpublished_capture(self, request_id: str, namespace: str) -> None:
+        """Remove the files of a capture this worker never published.
+
+        Worker role, and only where the writer has drained: the writer owns
+        these files until then, and deleting a layer out from under a queued
+        job leaves the donor's own record landing on top of a hole. That is
+        why the scheduler role does not do this -- it cannot see the queue --
+        and why the two callers here are the finish hook, which joins the
+        writer first, and teardown, which has stopped it.
+
+        A capture with no record is unreachable: nothing can match it and
+        nothing will ever read it, while the disk tier has no eviction of its
+        own, so left alone its layer files occupy the volume for good (a
+        measured ~1.2 GB at a 21.3K-token prompt).
+        """
+        if not namespace or self._config.kv_storage_backend != "disk":
+            return
+        if self._has_stored_donor(request_id, namespace):
+            return
+        donor_dir = self._donor_dir(request_id, namespace)
+        try:
+            names = os.listdir(donor_dir)
+        except OSError:
+            # Nothing landed at all, which is the common case for a capture
+            # whose first write failed.
+            return
+        if _DONOR_METADATA_FILENAME in names:
+            # Published between the check above and this listing: it is a
+            # donor now, and a donor's files are not orphans.
+            return
+        try:
+            for name in names:
+                os.remove(os.path.join(donor_dir, name))
+            os.rmdir(donor_dir)
+        except OSError:
+            self._stats["capture_orphan_discard_errors"] += 1
+            logger.warning("SemBlend orphaned donor capture removal failed", exc_info=True)
+            return
+        self._stats["capture_orphans_discarded_total"] += 1
+        self._audit_event(
+            "capture_orphan_discarded",
+            request_id=request_id,
+            files=len(names),
+            store_tier=self._config.kv_storage_backend,
+        )
+
+    def _register_pending_donor(
+        self, pending: _PendingDonorRegistration, *, waited: int = 0
+    ) -> None:
+        """Offer one prepared donor to the provider and audit the outcome.
+
+        ``waited`` is how many scheduler steps the donor spent held, which is
+        0 for the ordinary path where its record was already on the store.
+        """
+        donor = pending.donor
+        try:
             self._provider.register_donor(donor)
             self._stats["donors_registered_total"] += 1
             self._audit_event(
                 "donor_registered",
                 request_id=donor.donor_id,
                 namespace=donor.namespace,
-                tokens=len(token_ids),
-                blocks=len(block_ids),
+                tokens=len(donor.token_ids),
+                blocks=int(donor.metadata.get("num_blocks", 0)),
                 metadata=dict(donor.metadata),
-                donor_text_offset_tokens=int(donor_text_offset),
-                donor_text_chars=int(donor_text_chars),
-                donor_text_fallback=donor_text_fallback,
+                donor_text_offset_tokens=int(pending.text_offset),
+                donor_text_chars=int(pending.text_chars),
+                donor_text_fallback=pending.text_fallback,
+                # How many scheduler steps the donor waited for its own
+                # capture record; 0 is the ordinary path.
+                deferred_steps=int(waited),
                 store_tier=self._config.kv_storage_backend,
             )
             if self._config.log_decisions:
@@ -3280,8 +4049,8 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     "SemBlend donor registered request_id=%s namespace=%s tokens=%d blocks=%d",
                     donor.donor_id,
                     donor.namespace,
-                    len(token_ids),
-                    len(block_ids),
+                    len(donor.token_ids),
+                    int(donor.metadata.get("num_blocks", 0)),
                 )
         except Exception as exc:
             logger.exception("SemBlend donor registration failed")
@@ -3289,7 +4058,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             # Type only: a provider message can carry prompt content.
             self._audit_event(
                 "donor_registration_failed",
-                request_id=request_id,
+                request_id=donor.donor_id,
                 error_type=type(exc).__name__,
             )
 
@@ -3297,4 +4066,53 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         return ()
 
     def shutdown(self) -> None:
+        """Stop the capture writer, draining what it still holds.
+
+        The queue is drained rather than dropped, and the donors whose layers
+        are all in it get their metadata record submitted first: without that
+        submission a donor can end teardown with every tensor durable and no
+        record, which is bytes on a tier that never evicts them and no way to
+        ever find them.
+
+        It is also the scheduler role's last chance to register a donor that
+        was still waiting on its own capture record, so that pass runs here
+        too and anything still missing is declined rather than left held.
+
+        On the worker side it is the last chance in the other direction: once
+        the writer has stopped, a capture with no record will never get one,
+        and its files are deleted here rather than left on a tier that does
+        not evict. A writer still wedged in a write keeps its files, because
+        it may yet land the layer it is holding.
+
+        The closed writer stays on the connector, so a ``save_kv_layer`` after
+        this point is a named write failure rather than a silently restarted
+        thread. Every wait inside ``close`` is bounded by one deadline, and
+        the thread is a daemon with a process-level ``atexit`` close on top,
+        so a process that never reaches this path still cannot hang on it.
+        """
+        # Last call for the donors still waiting on a record: no scheduler
+        # hook runs after this one, so a donor left held here is lost.
+        self._retry_deferred_registrations(final=True)
+        writer = self._writer
+        if writer is None:
+            return None
+        # One deadline for the whole teardown, queueing the records included:
+        # when the store has wedged, the queue is full, and an unbounded wait
+        # for room in it is as good at hanging a process as an unbounded join.
+        # The two halves have their own floors, because they are different
+        # jobs: queueing the records can spend the whole budget waiting for
+        # room on a full queue, and the drain that the timeout is named after
+        # would then get none of it -- a merely slow store would be abandoned
+        # as though it had wedged.
+        budget = float(self._config.capture_write_close_timeout_s)
+        deadline = time.monotonic() + budget
+        self._submit_pending_finalizes(deadline=time.monotonic() + budget / 2.0)
+        writer.close(timeout=max(budget / 2.0, deadline - time.monotonic()))
+        self._drain_writer_reports()
+        if not writer.running:
+            # The writer is stopped, so nothing else is going to publish: what
+            # it never published is an orphan, and this is the last hook that
+            # can say so. A writer still wedged in a write keeps its files.
+            for request_id, namespace in list(self._capture_namespaces.items()):
+                self._discard_unpublished_capture(request_id, namespace)
         return None

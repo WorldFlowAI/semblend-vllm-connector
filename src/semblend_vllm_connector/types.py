@@ -153,9 +153,21 @@ class PendingStore:
     token_count: int
     namespace: str
     block_ids: tuple[list[int], ...] | None = None
+    #: Whether this store completes the donor -- the capture has reached the
+    #: prompt's cacheable prefix and no further chunk will arrive. The worker
+    #: publishes a donor's metadata record when its capture is complete, and
+    #: that record is what makes the donor discoverable, so this is the flag
+    #: that ends one donor's capture rather than a length the worker has to
+    #: guess at.
+    final: bool = False
 
 
 @dataclass
 class SemBlendConnectorMetadata(KVConnectorMetadata):
     loads: list[PendingLoad] = field(default_factory=list)
     stores: list[PendingStore] = field(default_factory=list)
+    #: Requests whose capture will receive no further chunk although no store
+    #: marked ``final`` closed it: decode started mid-capture, or the request
+    #: finished. The worker publishes what it holds for them, so a donor
+    #: shorter than its prompt is still discoverable.
+    finalize: list[str] = field(default_factory=list)

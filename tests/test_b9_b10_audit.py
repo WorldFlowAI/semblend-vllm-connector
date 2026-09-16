@@ -1132,12 +1132,16 @@ def test_capture_base_missing_is_audited_once_per_store(tmp_path) -> None:
                         token_count=token_count,
                         namespace="ns",
                         block_ids=([0, 1],),
+                        final=True,
                     )
                 ]
             )
         )
         connector.save_kv_layer("layers.0", kv_layer, attn_metadata=object())
         connector.save_kv_layer("layers.1", kv_layer, attn_metadata=object())
+        # The end of the step: the writer is joined and the donor is on the
+        # store rather than staged in its queue.
+        connector.wait_for_save()
 
     _capture(4)
     # The donor's stored tensors go between chunks (an eviction, a retracted

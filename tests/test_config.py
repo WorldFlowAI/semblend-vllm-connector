@@ -141,6 +141,12 @@ def test_getter_path_carries_every_config_field() -> None:
         "max_materialized_tokens": 2048,
         "allow_non_identical_request_only": "true",
         "capture_served_requests": "true",
+        "capture_policy": "sampled",
+        "capture_sample_rate": 0.25,
+        "capture_hint_key": "donor_please",
+        "capture_write_queue_depth": 8,
+        "capture_write_close_timeout_s": 2.5,
+        "donor_registration_retry_steps": 3,
         "kv_storage_backend": "MEMORY",
         "kv_memory_max_donors": 3,
         "min_boundary_tokens": 16,
@@ -175,6 +181,10 @@ def test_getter_path_carries_every_config_field() -> None:
     assert cfg.model_id == "m"
     assert cfg.embedder_type == "minilm"
     assert cfg.capture_served_requests is True
+    assert cfg.capture_policy == "sampled"
+    assert cfg.capture_sample_rate == 0.25
+    assert cfg.capture_hint_key == "donor_please"
+    assert cfg.capture_write_queue_depth == 8
     assert cfg.kv_storage_backend == "memory"
     assert cfg.kv_memory_max_donors == 3
     assert cfg.min_boundary_tokens == 16

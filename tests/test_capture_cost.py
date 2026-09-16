@@ -78,6 +78,7 @@ def test_capture_cost_is_reported_when_the_worker_sees_the_request_finish(tmp_pa
         token_count=8,
         namespace="ns",
         block_ids=([0, 1],),
+        final=True,
     )
     connector.bind_connector_metadata(SemBlendConnectorMetadata(loads=[], stores=[store]))
     connector.save_kv_layer(layer_name, layer, object())
