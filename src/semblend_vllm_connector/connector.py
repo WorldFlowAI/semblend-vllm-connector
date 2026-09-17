@@ -13,6 +13,7 @@ import time
 from collections import Counter, OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 from semblend_vllm_connector._vllm_compat import (
@@ -252,6 +253,29 @@ def _rope_parameter_sets(rope: Mapping[str, Any]) -> list[Mapping[str, Any]] | N
     if len(sets) != len(rope):
         return None
     return sets
+
+
+def _json_scalar(value: Any) -> Any:
+    """A value the audit line can hold.
+
+    The audit writer is plain ``json.dumps`` and a failure there drops the
+    WHOLE event, not the one field -- so a numpy float from a cosine kernel or
+    an Enum tier would make the miss vanish from the file while the miss
+    counter still ticked. Numpy scalars become Python scalars, Enums their
+    value, and anything else its string.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _json_scalar(item())
+        except Exception:
+            pass
+    enum_value = getattr(value, "value", None)
+    if isinstance(value, Enum):
+        return _json_scalar(enum_value)
+    return str(value)
 
 
 class SemBlendVllmConnector(KVConnectorBase_V1):
@@ -1314,6 +1338,23 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             self._stats["load_plan_revised_per_attempt"] += 1
         return previous != plan
 
+    def _provider_miss_diagnostics(self) -> dict:
+        """Miss reasons from the provider, when it offers them.
+
+        Optional by design: a provider that does not implement
+        ``last_lookup_diagnostics`` keeps working and simply audits less.
+        """
+        probe = getattr(self._provider, "last_lookup_diagnostics", None)
+        if not callable(probe):
+            return {}
+        try:
+            diagnostics = probe()
+        except Exception:
+            return {}
+        if not isinstance(diagnostics, dict):
+            return {}
+        return {f"miss_{key}": _json_scalar(value) for key, value in diagnostics.items()}
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -1550,6 +1591,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     query_text_offset_tokens=int(query_offset_tokens),
                     query_text_chars=int(query_text_chars),
                     query_text_fallback=query_text_fallback,
+                    # Why the provider declined. Without these a miss rate is
+                    # a number with no cause attached: nothing scoring above
+                    # the similarity floor, a candidate cut for too little
+                    # reuse, and an empty catalog all look identical.
+                    **self._provider_miss_diagnostics(),
                 )
             if self._config.log_decisions and first_lookup:
                 logger.info(

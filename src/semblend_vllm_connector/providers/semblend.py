@@ -48,6 +48,90 @@ def _segments_from_position_map(result) -> list | None:
     return segments or None
 
 
+MISS_DIAGNOSTIC_KEYS = (
+    "rejection_reason",
+    "donor_count",
+    "donor_count_scope",
+    "best_similarity",
+    "reuse_ratio",
+)
+
+
+def _donor_count(pipeline, namespace: str | None) -> tuple[int | None, str | None]:
+    """How many donors THIS lookup could see, and which population that is.
+
+    The store filters by namespace before it searches, so the whole-store size
+    answers a question nobody asked: a tenant whose namespace holds no donors
+    misses every request while the store reports a thousand. Prefer the
+    namespace-scoped count when the store offers one; otherwise say plainly
+    that the number is the whole store.
+    """
+    store = getattr(pipeline, "_donor_store", None)
+    if store is None:
+        return None, None
+    scoped = getattr(store, "visible_donors", None)
+    if callable(scoped) and namespace is not None:
+        try:
+            return int(scoped(namespace)), "namespace"
+        except Exception:
+            pass
+    size = getattr(store, "size", None)
+    if isinstance(size, bool):
+        return None, None
+    if isinstance(size, int):
+        return size, "store"
+    return None, None
+
+
+def _bare_reason(reason: object) -> str | None:
+    """The rejection reason without anything a provider message might carry.
+
+    The pipeline reports an internal failure as ``pipeline_error: <message>``,
+    and a provider message can contain prompt text. Only the class of failure
+    travels, matching what the connector does with exceptions on the sibling
+    path.
+    """
+    if not isinstance(reason, str) or not reason:
+        return None
+    if reason.startswith("pipeline_error"):
+        return "pipeline_error"
+    return reason
+
+
+def _miss_diagnostics(result, pipeline, namespace: str | None) -> dict:
+    """The declining pipeline's own numbers, in a fixed shape for an audit row.
+
+    Every key in MISS_DIAGNOSTIC_KEYS is present on every miss; a value the
+    pipeline did not actually compute is None, never a dataclass default. On
+    a ``no_donor_match`` the pipeline returns a fresh result carrying only the
+    reason, so similarity and reuse read as their defaults there and MUST NOT
+    be reported as measurements -- an earlier draft did exactly that and
+    audited ``0.0`` as if the best candidate had scored zero.
+    """
+    count, scope = _donor_count(pipeline, namespace)
+    diagnostics: dict = {
+        "rejection_reason": _bare_reason(getattr(result, "rejection_reason", None))
+        if result is not None
+        else "no_result",
+        "donor_count": count,
+        "donor_count_scope": scope,
+        "best_similarity": None,
+        "reuse_ratio": None,
+    }
+    if result is None:
+        return diagnostics
+    # Only the decline paths that held a candidate know these. The pipeline
+    # sets them on those results (semblend >= 0.3.24); an older pipeline
+    # leaves the defaults, which are excluded by the > 0 test.
+    similarity = getattr(result, "similarity", None)
+    if isinstance(similarity, (int, float)) and not isinstance(similarity, bool) and similarity > 0:
+        diagnostics["best_similarity"] = float(similarity)
+    reuse = getattr(result, "reuse_ratio", None)
+    if isinstance(reuse, (int, float)) and not isinstance(reuse, bool) and reuse > 0:
+        diagnostics["reuse_ratio"] = float(reuse)
+    return diagnostics
+
+
 class SemBlendPipelineProvider:
     """Adapter from the connector provider protocol to SemBlendPipeline."""
 
@@ -62,6 +146,7 @@ class SemBlendPipelineProvider:
 
         self._config = config
         self._pipeline = self._create_pipeline(SemBlendPipeline, config)
+        self._last_miss: dict | None = None
 
     def _create_pipeline(self, pipeline_cls, config: SemBlendVllmConfig):
         try:
@@ -102,7 +187,21 @@ class SemBlendPipelineProvider:
             extra_key=request.namespace,
         )
         if not result or not result.found or not result.donor_id:
+            # The pipeline knows why it declined; the protocol can only say
+            # None. Keep the reason so the caller can record it -- without it
+            # a miss cannot be told apart from "nothing scored high enough".
+            # Collected under a guard: diagnostics are never worth turning a
+            # miss into a provider error.
+            try:
+                self._last_miss = _miss_diagnostics(result, self._pipeline, request.namespace)
+            except Exception as exc:
+                self._last_miss = {
+                    **{key: None for key in MISS_DIAGNOSTIC_KEYS},
+                    "rejection_reason": _bare_reason(getattr(result, "rejection_reason", None)),
+                    "diagnostics_error": type(exc).__name__,
+                }
             return None
+        self._last_miss = None
 
         segments = _segments_from_position_map(result)
         return SemanticLookupResult(
@@ -125,6 +224,10 @@ class SemBlendPipelineProvider:
             },
             reason="semblend_discovery",
         )
+
+    def last_lookup_diagnostics(self) -> dict | None:
+        """Why the most recent lookup missed, or None if it hit."""
+        return self._last_miss
 
     def register_donor(self, donor: DonorRegistration) -> None:
         """Register a completed request as a donor.
