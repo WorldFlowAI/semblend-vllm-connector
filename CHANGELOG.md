@@ -5,6 +5,21 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
+## 0.2.7 - 2026-09-19
+
+### Added
+
+**A recorded miss says why it missed.** `semantic_lookup_miss` now carries a
+fixed set of `miss_` fields from the provider: `rejection_reason`,
+`donor_count`, `donor_count_scope`, `best_similarity`, `reuse_ratio`. Only
+what was measured is reported; a value the pipeline did not compute is
+`null`, never a dataclass default. The donor count is the namespace this
+lookup could see (semblend >= 0.3.24 offers `DonorStore.visible_donors`) and
+says so when it can only count the whole store. Exception text never reaches
+the audit, values are made JSON-safe before the row is written, and a
+failing diagnostic cannot turn a miss into a provider error. A provider
+without `last_lookup_diagnostics()` audits as before.
+
 ## 0.2.6 - 2026-09-16
 
 Donor capture no longer writes on the engine's prefill thread. Measured in the
