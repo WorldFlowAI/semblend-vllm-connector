@@ -53,6 +53,15 @@ positions where the donor holds exactly the target's token. Written as
 `semantic_span_multi_donor_declined` when the chain falls short of
 `min_semantic_span`.
 
+**Segmented prefill hooks (for a scheduler that asks mid-prefill).**
+`get_prefill_compute_limit(request, position)` says how far to compute before
+the next reusable run (to the first block edge inside it), and
+`get_num_new_matched_tokens_mid_prefill(request, position)` plans the load of
+that run when the chunk reaches it. Both reuse the request's admission lookup,
+so every later segment costs a plan, not a search. Stock vLLM does not call
+them; they exist for a scheduler change proposed separately
+(`min_mid_prefill_segment`, default 128, is the floor for a later segment).
+
 ### Changed
 
 **The capture copy no longer stalls the forward pass (`capture_async_copy`,

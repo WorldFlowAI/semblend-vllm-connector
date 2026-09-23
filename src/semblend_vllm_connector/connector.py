@@ -407,6 +407,9 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # Scheduler-side: requests that are one stage of a staged prefill
         # (stage_hint_key). Their filled blocks stay in the prefix cache.
         self._stage_requests: set[str] = set()
+        # Scheduler-side: the namespace each memoized lookup was made under,
+        # for segmented prefill's later segments.
+        self._segment_namespaces: dict[str, str] = {}
         self._capture_stream: Any = None
         # What the writer thread has to tell the forward thread. The audit
         # join key and the main counters are per-request state with no lock on
@@ -1619,6 +1622,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 elapsed_ms = int((time.monotonic() - started) * 1000)
                 self._stats["lookup_latency_ms_sum"] += elapsed_ms
             self._lookup_cache[request_id] = result
+            self._segment_namespaces[request_id] = namespace
 
         if result is None:
             if first_lookup:
@@ -2057,6 +2061,112 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 boundary=int(num_computed_tokens),
             )
         return 0, False
+
+    # ------------------------------------------------------ segmented prefill
+
+    def _segment_runs(self, request_id: str) -> tuple[list[dict], str] | None:
+        """The admission lookup's runs for this request, trimmed to capture."""
+        if self._config.mode != ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL:
+            return None
+        result = self._lookup_cache.get(request_id)
+        plan_namespace = self._segment_namespaces.get(request_id)
+        if result is None or not result.segments or plan_namespace is None:
+            return None
+        stored = {}
+        runs = []
+        for seg in result.segments:
+            if seg.donor_id not in stored:
+                stored[seg.donor_id] = self._stored_donor_token_count(seg.donor_id, plan_namespace)
+            length = min(seg.token_count, stored[seg.donor_id] - seg.donor_start)
+            if length > 0:
+                runs.append(
+                    {
+                        "donor_id": seg.donor_id,
+                        "donor_start": seg.donor_start,
+                        "target_start": seg.target_start,
+                        "length": length,
+                    }
+                )
+        return runs, plan_namespace
+
+    def get_num_new_matched_tokens_mid_prefill(self, request: Any, num_computed_tokens: int) -> int:
+        """Tokens loadable at a running prefill's position (segmented prefill).
+
+        Called by a scheduler that supports segmented prefill once a chunk has
+        ended where the next reusable segment begins. Plans a load exactly as
+        the admission path does -- the scheduler then calls
+        update_state_after_alloc -- and returns its size, or 0.
+        """
+        request_id = self._request_id(request)
+        if num_computed_tokens % self._block_size != 0:
+            return 0
+        found = self._segment_runs(request_id)
+        if found is None:
+            return 0
+        runs, namespace = found
+        pieces = chain_at_boundary(runs, num_computed_tokens, self._block_size)
+        token_ids = self._token_ids(request)
+        headroom = max(
+            0,
+            _cacheable_prefix_tokens(len(token_ids), self._block_size) - num_computed_tokens,
+        )
+        pieces = trim_pieces(pieces, num_computed_tokens + headroom)
+        token_count = sum(piece["token_count"] for piece in pieces)
+        if token_count < self._config.min_mid_prefill_segment:
+            return 0
+        first = pieces[0]
+        self._record_load_plan(
+            request_id,
+            donor_id=str(first["donor_id"]),
+            token_count=token_count,
+            materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+            namespace=namespace,
+            boundary=int(num_computed_tokens),
+            donor_start=int(first["donor_start"]),
+            target_start=int(num_computed_tokens),
+            pieces=tuple(
+                LoadPiece(
+                    donor_id=str(piece["donor_id"]),
+                    donor_start=int(piece["donor_start"]),
+                    target_start=int(piece["target_start"]),
+                    token_count=int(piece["token_count"]),
+                )
+                for piece in pieces
+            ),
+        )
+        self._stats["segmented_prefill_segments_total"] += 1
+        self._audit_event(
+            "segmented_prefill_segment_advertised",
+            request_id=request_id,
+            namespace=namespace,
+            boundary=int(num_computed_tokens),
+            token_count=int(token_count),
+            donors_used=len({piece["donor_id"] for piece in pieces}),
+        )
+        return token_count
+
+    def get_prefill_compute_limit(self, request: Any, compute_from: int) -> int | None:
+        """How far to compute before the next reusable segment, or None.
+
+        The chunk ends at the first block edge inside the next run that can
+        still clear the segment floor after it, so the following step's
+        position is block-aligned and inside that run.
+        """
+        found = self._segment_runs(self._request_id(request))
+        if found is None:
+            return None
+        runs, _ = found
+        block = self._block_size
+        best = None
+        for run in runs:
+            start = int(run["target_start"])
+            end = start + int(run["length"])
+            edge = -(-start // block) * block
+            if edge <= compute_from or edge + self._config.min_mid_prefill_segment > end:
+                continue
+            if best is None or edge < best:
+                best = edge
+        return None if best is None else best - compute_from
 
     def _plan_multi_donor_span(
         self,
@@ -4082,6 +4192,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         request_id = self._request_id(request)
         self._lookup_cache.pop(request_id, None)
         self._stage_requests.discard(request_id)
+        self._segment_namespaces.pop(request_id, None)
         self._load_plans.pop(request_id, None)
         self._attempts.pop(request_id, None)
         self._no_safe_plan_reasons.pop(request_id, None)

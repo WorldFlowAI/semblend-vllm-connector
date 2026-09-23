@@ -126,6 +126,12 @@ class SemBlendVllmConfig:
     # only the span's outer ends are block-aligned). Needs a provider that
     # returns multi-donor segments (SemBlend with SEMBLEND_MULTI_DONOR=1).
     multi_donor_spans: bool = True
+    # Segmented prefill, for an engine whose scheduler asks the connector
+    # again part-way through a prefill (get_num_new_matched_tokens_mid_prefill
+    # and get_prefill_compute_limit; not in stock vLLM). Later segments reuse
+    # the admission lookup, so they cost a plan, not a search. A later segment
+    # shorter than this floor is computed rather than loaded.
+    min_mid_prefill_segment: int = 128
     # Lowest local prefix-cache boundary (num_computed_tokens) at which the
     # connector will serve; below it the request is declined and the engine
     # prefills it. 0 disables the gate. Why it exists: blocks the connector
@@ -335,6 +341,9 @@ class SemBlendVllmConfig:
             ),
             min_boundary_tokens=_read_int(
                 extra, "min_boundary_tokens", "SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", 0
+            ),
+            min_mid_prefill_segment=_read_int(
+                extra, "min_mid_prefill_segment", "SEMBLEND_VLLM_MIN_MID_PREFILL_SEGMENT", 128
             ),
             multi_donor_spans=_read_bool(
                 extra, "multi_donor_spans", "SEMBLEND_VLLM_MULTI_DONOR_SPANS", True
