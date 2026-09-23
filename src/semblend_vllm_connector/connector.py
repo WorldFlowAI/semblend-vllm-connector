@@ -294,6 +294,10 @@ def _json_scalar(value: Any) -> Any:
 class SemBlendVllmConnector(KVConnectorBase_V1):
     """Safe-by-default SemBlend-backed vLLM OOT connector."""
 
+    # Opt in to segmented prefill on a scheduler that supports it (the flag
+    # is how the scheduler tells a real implementation from a stub).
+    supports_segmented_prefill = True
+
     def __init__(
         self,
         vllm_config: "VllmConfig",

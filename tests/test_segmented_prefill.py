@@ -96,3 +96,9 @@ def test_a_request_the_connector_never_looked_up_is_untouched(tmp_path):
     connector, _, request = _setup(tmp_path)
     assert connector.get_prefill_compute_limit(request, 0) is None
     assert connector.get_num_new_matched_tokens_mid_prefill(request, 64) == 0
+
+
+def test_the_connector_opts_in_on_its_class():
+    from semblend_vllm_connector.connector import SemBlendVllmConnector
+
+    assert SemBlendVllmConnector.supports_segmented_prefill is True
