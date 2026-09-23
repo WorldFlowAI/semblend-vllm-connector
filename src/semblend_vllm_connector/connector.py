@@ -198,6 +198,16 @@ def _hint_is_set(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _pageable(tensor: Any) -> Any:
+    """``tensor`` in ordinary host memory; a pinned tensor is copied out."""
+    is_pinned = getattr(tensor, "is_pinned", None)
+    if callable(is_pinned) and is_pinned():
+        import torch
+
+        return torch.empty_like(tensor, pin_memory=False).copy_(tensor)
+    return tensor
+
+
 def _common_prefix_len(left: list[int], right: list[int]) -> int:
     count = 0
     for a, b in zip(left, right):
@@ -388,6 +398,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         # yet durable. A chunked capture reads its own earlier chunk back to
         # append to it, and those bytes may still be in the queue.
         self._inflight_layers: dict[tuple[str, str], Any] = {}
+        # The copy-complete event of each staged layer still in flight, and the
+        # side stream those copies run on (created at the first async copy).
+        self._inflight_ready: dict[tuple[str, str], Any] = {}
+        # Scheduler-side: requests that are one stage of a staged prefill
+        # (stage_hint_key). Their filled blocks stay in the prefix cache.
+        self._stage_requests: set[str] = set()
+        self._capture_stream: Any = None
         # What the writer thread has to tell the forward thread. The audit
         # join key and the main counters are per-request state with no lock on
         # them, so the writer touches neither: it leaves counts and rows here
@@ -1040,13 +1057,29 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 f"len(block_ids[0])={len(block_ids[0])} covers only "
                 f"{max(covered, 0)} token(s) from target_start"
             )
-        block_ids_tensor = torch.tensor(group, device=device)
+        block_ids_tensor = self._index_tensor(group, device)
         block_offsets = torch.arange(0, self._block_size, device=device)
         slot_mapping = (
             block_offsets.reshape((1, self._block_size))
             + block_ids_tensor.reshape((len(group), 1)) * self._block_size
         )
         return slot_mapping.flatten()[offset : offset + token_count]
+
+    @staticmethod
+    def _index_tensor(values: list[int], device: Any):
+        """``values`` on ``device`` without making the host wait for the GPU.
+
+        ``torch.tensor(values, device=cuda)`` copies from pageable memory,
+        which the host can only do once the device has finished all earlier
+        work on the stream -- every layer before this one. From pinned memory
+        the copy is queued behind that work instead.
+        """
+        import torch
+
+        host = torch.tensor(values, dtype=torch.int64)
+        if getattr(device, "type", str(device)) != "cuda" and not str(device).startswith("cuda"):
+            return host.to(device)
+        return host.pin_memory().to(device, non_blocking=True)
 
     def _model_head_size(self) -> int | None:
         """The model's per-head KV width, or None when the config is silent."""
@@ -1518,6 +1551,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             return 0, False
 
         namespace = namespace_for_request(self._config, self._vllm_config, request)
+        if request_id not in self._stage_requests and self._hinted(
+            request, self._config.stage_hint_key
+        ):
+            self._stage_requests.add(request_id)
+
+        if self._span_run_ruled_out(request_id, attempt, token_ids, namespace, num_computed_tokens):
+            return 0, False
 
         # A waiting request re-enters this hook on every scheduling step. The
         # lookup itself is memoized; the counters and audit events have to be
@@ -2009,6 +2049,63 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             )
         return 0, False
 
+    def _span_run_ruled_out(
+        self,
+        request_id: str,
+        attempt: int,
+        token_ids: list[int],
+        namespace: str,
+        num_computed_tokens: int,
+    ) -> bool:
+        """Whether the provider rules out any servable span before the lookup.
+
+        A served span is an identical run that starts at the block-aligned
+        boundary and is at least ``min_semantic_span`` long after the clamps,
+        so a provider that can say no donor in the namespace holds that run
+        has decided the request before any embedding. On a stream of unique
+        documents that is most lookups. Attempt-scoped, like the gates above:
+        the boundary moves between attempts. Any failure here is a "maybe".
+        """
+        if (
+            self._config.mode != ReuseMode.SEMANTIC_SPAN_EXPERIMENTAL
+            or not self._config.lookup_precheck
+        ):
+            return False
+        check = getattr(self._provider, "span_run_possible", None)
+        if check is None:
+            return False
+        block = max(1, int(self._block_size or 1))
+        usable_from = ((int(num_computed_tokens) + block - 1) // block) * block
+        length = int(self._config.min_semantic_span)
+        started = time.monotonic()
+        try:
+            possible = check(token_ids, namespace, usable_from, length)
+        except Exception as exc:
+            self._stats["lookup_precheck_errors_total"] += 1
+            logger.debug("SemBlend span precheck failed: %s", type(exc).__name__)
+            return False
+        if possible is not False:
+            return False
+        self._stats["skipped_no_shared_run_per_attempt"] += 1
+        self._audit_event(
+            "lookup_skipped_no_shared_run",
+            request_id=request_id,
+            attempt=attempt,
+            namespace=namespace,
+            boundary=int(num_computed_tokens),
+            usable_from=int(usable_from),
+            min_semantic_span=length,
+            prompt_tokens=len(token_ids),
+            precheck_us=int((time.monotonic() - started) * 1_000_000),
+        )
+        if self._config.log_decisions:
+            logger.info(
+                "SemBlend lookup skipped request_id=%s reason=no_shared_run usable_from=%d",
+                request_id,
+                usable_from,
+            )
+        return True
+
     def _no_safe_plan_reason(
         self, result: SemanticLookupResult, namespace: str, num_computed_tokens: int
     ) -> str:
@@ -2114,7 +2211,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         tracked and audited but left cached, which is the contaminated control
         a measurement of the eviction's effect needs.
         """
-        if self._config.evict_filled_blocks_from_prefix_cache:
+        if (
+            self._config.evict_filled_blocks_from_prefix_cache
+            and request_id not in self._stage_requests
+        ):
             return self._evict_filled_blocks(request_id, state, phase=phase)
         return self._note_filled_blocks_left_cached(request_id, state, phase=phase)
 
@@ -2156,6 +2256,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._audit_event(
             "prefix_cache_blocks_left_cached",
             request_id=request_id,
+            staged_prefill=request_id in self._stage_requests,
             donor_id=state.donor_id,
             namespace=state.namespace,
             phase=phase,
@@ -2568,8 +2669,13 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
 
         ``all`` decides nothing, which is what keeps it byte-for-byte the
         selection every earlier release made: the gate returns None before it
-        reads anything about the request.
+        reads anything about the request -- except a stage of a staged
+        prefill, which is never a donor under any policy: it is a prefix of
+        the request that follows it, and as a donor it would outrank the real
+        one for that request while supplying nothing past its own end.
         """
+        if self._hinted(request, self._config.stage_hint_key):
+            return "staged_prefill_stage"
         policy = self._config.capture_policy
         if policy == "sampled":
             return None if self._sampled_for_capture(request_id) else "not_sampled"
@@ -2593,7 +2699,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         return int.from_bytes(digest, "big") < rate * float(1 << 64)
 
     def _capture_hinted(self, request: Any) -> bool:
-        """Whether the caller marked this request as a donor worth capturing.
+        """Whether the caller marked this request as a donor worth capturing."""
+        return self._hinted(request, self._config.capture_hint_key)
+
+    def _hinted(self, request: Any, key: str) -> bool:
+        """Whether the caller set hint ``key`` on this request.
 
         Read from the places a router can reach: the request's sampling-params
         ``extra_args`` (vLLM's OpenAI server forwards ``vllm_xargs`` into it),
@@ -2601,7 +2711,6 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         -- under the bare key and the ``x-`` prefixed spelling -- and an
         attribute of that name on the request object itself.
         """
-        key = self._config.capture_hint_key
         candidates = [getattr(request, key, None)]
         extra_args = getattr(getattr(request, "sampling_params", None), "extra_args", None)
         if isinstance(extra_args, Mapping):
@@ -3204,17 +3313,23 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         )
         kv_cache = self._extract_kv_from_layer(kv_layer, slot_mapping, attn_metadata)
         copy_started = time.monotonic()
-        host_kv = kv_cache.detach().contiguous().cpu()
+        host_kv, ready = self._copy_to_host(kv_cache)
         copy_ms = (time.monotonic() - copy_started) * 1000.0
         # Measured before the concat with the earlier chunks: this is what
         # crossed the PCIe link on this call, not what the donor now holds.
         copy_bytes = int(host_kv.numel()) * int(host_kv.element_size())
         if base is not None:
+            # A continuation chunk appends on this thread, so it needs its
+            # bytes now. Only chunked prefills get here; a first chunk stays
+            # asynchronous end to end.
+            if ready is not None:
+                ready.synchronize()
+                ready = None
             # MLA captures are [tokens, C]; every other layout [2, tokens, H*D].
             host_kv = torch.cat((base, host_kv), dim=0 if host_kv.dim() == 2 else 1)
         actual_token_count = start + int(slot_mapping.numel())
         write_started = time.monotonic()
-        self._submit_captured_layer(store, layer_name, host_kv, actual_token_count)
+        self._submit_captured_layer(store, layer_name, host_kv, actual_token_count, ready=ready)
         # What the write costs the forward pass, which is now the handoff and
         # nothing else unless the writer's queue was full.
         write_ms = (time.monotonic() - write_started) * 1000.0
@@ -3227,6 +3342,36 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             write_ms=write_ms,
             copy_bytes=copy_bytes,
         )
+
+    def _copy_to_host(self, kv_cache: Any) -> tuple[Any, Any]:
+        """Start the device-to-host copy of one captured layer.
+
+        Returns the host tensor and, when the copy is still in flight, the
+        CUDA event that completes it; whoever reads the bytes waits on that
+        event first. The copy runs on a side stream ordered after the work
+        that produced ``kv_cache``, into pinned memory, so it overlaps the
+        layers still to run instead of stalling the forward pass.
+        """
+        import torch
+
+        source = kv_cache.detach()
+        if not self._config.capture_async_copy or source.device.type != "cuda":
+            return source.contiguous().cpu(), None
+        stream = self._capture_stream
+        if stream is None:
+            stream = self._capture_stream = torch.cuda.Stream(device=source.device)
+        stream.wait_stream(torch.cuda.current_stream(source.device))
+        with torch.cuda.stream(stream):
+            contiguous = source.contiguous()
+            host = torch.empty(contiguous.shape, dtype=contiguous.dtype, pin_memory=True)
+            host.copy_(contiguous, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(stream)
+        # The gathered tensor belongs to the compute stream's allocator pool;
+        # without this its memory could be handed out again before the copy
+        # has read it.
+        source.record_stream(stream)
+        return host, ready
 
     def _note_capture_cost(
         self,
@@ -3346,8 +3491,12 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         storage_key = self._storage_key(store.request_id, store.namespace)
         with self._store_lock:
             staged = self._inflight_layers.get((storage_key, layer_name))
-            if staged is not None:
-                return staged
+            ready = self._inflight_ready.get((storage_key, layer_name))
+        if staged is not None:
+            if ready is not None:
+                ready.synchronize()
+            return staged
+        with self._store_lock:
             if self._config.kv_storage_backend == "memory":
                 entry = self._memory_store.get(storage_key)
                 return None if entry is None else entry.get(layer_name)
@@ -3380,12 +3529,22 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         return self._writer
 
     def _submit_captured_layer(
-        self, store: PendingStore, layer_name: str, host_kv: Any, token_count: int
+        self,
+        store: PendingStore,
+        layer_name: str,
+        host_kv: Any,
+        token_count: int,
+        *,
+        ready: Any = None,
     ) -> None:
         """Hand one layer's host copy to the writer and return to the forward pass."""
         storage_key = self._storage_key(store.request_id, store.namespace)
         with self._store_lock:
             self._inflight_layers[(storage_key, layer_name)] = host_kv
+            if ready is None:
+                self._inflight_ready.pop((storage_key, layer_name), None)
+            else:
+                self._inflight_ready[(storage_key, layer_name)] = ready
         self._submit_write(
             WriteJob(
                 request_id=store.request_id,
@@ -3394,6 +3553,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 layer_name=layer_name,
                 payload=host_kv,
                 token_count=int(token_count),
+                ready=ready,
             )
         )
 
@@ -3423,6 +3583,8 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         No metadata record is written here. The record is the donor's
         visibility, and a donor with one layer on disk is not yet a donor.
         """
+        if job.ready is not None:
+            job.ready.synchronize()
         storage_key = self._storage_key(job.request_id, job.namespace)
         layer_name = str(job.layer_name)
         if self._config.kv_storage_backend == "memory":
@@ -3439,8 +3601,11 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 else:
                     entry["__token_count__"] = job.token_count
                     self._memory_store.move_to_end(storage_key)
-                entry[layer_name] = job.payload
+                # Pageable, not the pinned staging buffer: this copy lives as
+                # long as the donor, and pinned host memory is scarce.
+                entry[layer_name] = _pageable(job.payload)
                 self._inflight_layers.pop((storage_key, layer_name), None)
+                self._inflight_ready.pop((storage_key, layer_name), None)
             self._writer_count("capture_layer_writes_total")
             return
         from safetensors.torch import save_file
@@ -3450,6 +3615,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         save_file({"kv_cache": job.payload}, os.path.join(donor_dir, f"{layer_name}.safetensors"))
         with self._store_lock:
             self._inflight_layers.pop((storage_key, layer_name), None)
+            self._inflight_ready.pop((storage_key, layer_name), None)
         self._writer_count("capture_layer_writes_total")
 
     def _write_donor_metadata(self, job: WriteJob) -> None:
@@ -3669,6 +3835,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 # Not written, so it must not pass for this donor's copy on
                 # the next chunk; that chunk restarts from 0 instead.
                 self._inflight_layers.pop((storage_key, job.layer_name), None)
+                self._inflight_ready.pop((storage_key, job.layer_name), None)
         logger.warning(
             "SemBlend donor capture write failed request_id=%s kind=%s",
             job.request_id,
@@ -3795,6 +3962,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         self._retry_deferred_registrations()
         request_id = self._request_id(request)
         self._lookup_cache.pop(request_id, None)
+        self._stage_requests.discard(request_id)
         self._load_plans.pop(request_id, None)
         self._attempts.pop(request_id, None)
         self._no_safe_plan_reasons.pop(request_id, None)

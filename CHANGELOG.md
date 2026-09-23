@@ -5,6 +5,53 @@ All notable changes to this project will be documented here.
 This project uses pre-1.0 semantic versioning. Breaking behavior may change
 between minor releases while the vLLM semantic KV interface is experimental.
 
+## 0.2.8 - 2026-09-23
+
+### Added
+
+**Lookups ruled out before they run (`lookup_precheck`, on by default).** In
+semantic-span mode a served span is an identical run that covers the
+block-aligned boundary and reaches `min_semantic_span` past it. Before the
+lookup, the connector asks the provider whether any donor in the request's
+namespace could hold that run (`span_run_possible`, SemBlend >= 0.3.25). A
+"no" is exact and skips the text decode, embedding and search; it is written
+as `lookup_skipped_no_shared_run` and counted per attempt, like the other
+lookup gates. A provider without the method, a "maybe", or an error runs the
+lookup as before. Motivation, measured on the phase-0 anchored stream (A10G,
+1,250 requests): 848 lookups ended in `no_donor_match` on documents the store
+had never seen, at 15 ms median each, and 104 more found a donor whose span
+missed the boundary, at 33 ms.
+
+**Staged prefill (`stage_hint_key`, default `semblend_stage`).** A caller that
+knows where a prompt's edits are can send each prefix up to the next shared
+run first, tagged with the hint, and the full prompt last. A tagged request
+keeps the blocks this connector filled in vLLM's prefix cache instead of
+having them evicted, so the next stage's boundary lands past the edit and the
+shared text after it can be served. This is how an edited document reuses KV
+on the stock connector interface, which serves one contiguous span from the
+cached prefix per request. Stages are never captured as donors under any
+policy: a prefix of the next request would outrank its real donor.
+`prefix_cache_blocks_left_cached` now carries `staged_prefill`.
+
+Tradeoff, stated: a stage's filled blocks stay exact-matchable until vLLM
+evicts them, so a later request with the same leading tokens is served that
+donor-derived KV by the engine's own prefix cache -- the same KV this
+connector would serve it, but without a lookup deciding so.
+
+### Changed
+
+**The capture copy no longer stalls the forward pass (`capture_async_copy`,
+on by default).** Each captured layer was copied with a blocking `.cpu()` and
+its slot index was built from pageable memory, which makes the host wait for
+the GPU to finish every earlier layer; on the anchored stream that was 26 ms
+median of copy per unserved request plus a host-device sync per layer. The
+copy now runs on a side CUDA stream into pinned memory and completes on an
+event; the writer thread waits on the event before it writes, and a chunked
+continuation waits before it appends. The slot index goes through pinned
+memory with a non-blocking upload. `copy_ms` now measures the launch, not the
+transfer. The per-step join in `wait_for_save` is unchanged. The memory store
+tier keeps pageable copies, not the pinned staging buffers.
+
 ## 0.2.7 - 2026-09-19
 
 ### Added

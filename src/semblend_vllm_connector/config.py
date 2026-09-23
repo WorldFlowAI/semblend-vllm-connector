@@ -115,6 +115,12 @@ class SemBlendVllmConfig:
     # span out of it, so the lookup is pure miss tax (validation_warnings).
     min_prompt_tokens: int = 512
     min_semantic_span: int = 512
+    # Semantic-span mode: before the lookup, ask the provider whether any
+    # donor in the namespace could hold an identical run from the boundary
+    # long enough to clear min_semantic_span. A provider that answers "no"
+    # has ruled the load out, so the embedding and search are skipped. The
+    # answer is exact in that direction; "maybe" runs the lookup as before.
+    lookup_precheck: bool = True
     # Lowest local prefix-cache boundary (num_computed_tokens) at which the
     # connector will serve; below it the request is declined and the engine
     # prefills it. 0 disables the gate. Why it exists: blocks the connector
@@ -191,6 +197,13 @@ class SemBlendVllmConfig:
     # come from -- both the bare key and "x-"-prefixed -- and from an
     # attribute of that name on the request object.
     capture_hint_key: str = "semblend_capture"
+    # A request carrying this hint is one stage of a staged prefill: a caller
+    # that split a prompt at its edits sends each prefix first so the engine
+    # computes the edited text and the next stage finds it in the prefix
+    # cache. Such a request keeps the blocks this connector filled in that
+    # cache instead of having them evicted, because the next stage is the same
+    # prompt and needs them. Read from the same places as the capture hint.
+    stage_hint_key: str = "semblend_stage"
     # How many donor writes may be queued for the writer thread before the
     # forward pass has to wait for it. A full queue means the store is slower
     # than the engine produces captures; the submitting thread blocks and the
@@ -198,6 +211,10 @@ class SemBlendVllmConfig:
     # dropped: a dropped layer would leave a donor advertising bytes that were
     # never written.
     capture_write_queue_depth: int = 64
+    # Copy captured layers to pinned host memory on a side CUDA stream, so the
+    # forward pass launches the copy and moves on instead of waiting for the
+    # GPU to reach the layer and for the bytes to cross PCIe.
+    capture_async_copy: bool = True
     # How long teardown waits for the writer to drain, in seconds, covering
     # the whole of the stop: a store that has wedged leaves the queue full, so
     # handing the writer its stop signal is part of the wait and not ahead of
@@ -314,6 +331,9 @@ class SemBlendVllmConfig:
             min_boundary_tokens=_read_int(
                 extra, "min_boundary_tokens", "SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", 0
             ),
+            lookup_precheck=_read_bool(
+                extra, "lookup_precheck", "SEMBLEND_VLLM_LOOKUP_PRECHECK", True
+            ),
             evict_filled_blocks_from_prefix_cache=_read_bool(
                 extra,
                 "evict_filled_blocks_from_prefix_cache",
@@ -381,6 +401,14 @@ class SemBlendVllmConfig:
             capture_sample_rate=_read_float(
                 extra, "capture_sample_rate", "SEMBLEND_VLLM_CAPTURE_SAMPLE_RATE", 1.0
             ),
+            stage_hint_key=str(
+                extra.get(
+                    "stage_hint_key",
+                    os.environ.get("SEMBLEND_VLLM_STAGE_HINT_KEY", "semblend_stage"),
+                )
+            )
+            .strip()
+            .lower(),
             capture_hint_key=str(
                 extra.get(
                     "capture_hint_key",
@@ -389,6 +417,9 @@ class SemBlendVllmConfig:
             )
             .strip()
             .lower(),
+            capture_async_copy=_read_bool(
+                extra, "capture_async_copy", "SEMBLEND_VLLM_CAPTURE_ASYNC_COPY", True
+            ),
             capture_write_queue_depth=_read_int(
                 extra,
                 "capture_write_queue_depth",

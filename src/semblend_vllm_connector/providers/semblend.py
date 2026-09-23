@@ -225,6 +225,19 @@ class SemBlendPipelineProvider:
             reason="semblend_discovery",
         )
 
+    def span_run_possible(
+        self, token_ids, namespace: str | None, start: int, length: int
+    ) -> bool | None:
+        """Whether a donor in ``namespace`` could hold this identical run.
+
+        ``False`` is exact; ``None`` means this SemBlend cannot say (older
+        releases have no run filter).
+        """
+        check = getattr(self._pipeline, "span_run_possible", None)
+        if check is None:
+            return None
+        return check(list(token_ids), namespace, int(start), int(length))
+
     def last_lookup_diagnostics(self) -> dict | None:
         """Why the most recent lookup missed, or None if it hit."""
         return self._last_miss

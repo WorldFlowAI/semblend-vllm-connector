@@ -93,6 +93,10 @@ class WriteJob:
     payload: Any = None
     token_count: int = 0
     layer_names: tuple[str, ...] = ()
+    #: For a layer job whose host copy is still in flight on a side stream:
+    #: the CUDA event that completes it. The writer waits on it, the forward
+    #: pass never does.
+    ready: Any = None
 
 
 class CaptureWriter:
