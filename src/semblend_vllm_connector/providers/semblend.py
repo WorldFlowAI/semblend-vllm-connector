@@ -48,6 +48,67 @@ def _segments_from_position_map(result) -> list | None:
     return segments or None
 
 
+def _segments_from_multi_donor_map(result, pipeline, target_tokens) -> list | None:
+    """Contiguous, token-identical runs from a multi-donor composite alignment.
+
+    The composite maps each target position to a (donor, donor position)
+    pair; a position is kept only when the donor holds exactly the target's
+    token there, since a span is served verbatim. Runs break wherever the
+    donor changes or either side stops advancing by one.
+    """
+    mapping = getattr(result, "multi_donor_position_map", None)
+    if mapping is None:
+        return None
+    donor_ids = list(getattr(mapping, "donor_ids", ()) or ())
+    donors = list(getattr(mapping, "donor_positions", ()) or ())
+    targets = list(getattr(mapping, "target_positions", ()) or ())
+    if not donors or not (len(donor_ids) == len(donors) == len(targets)):
+        return None
+    store = getattr(pipeline, "_donor_store", None)
+    get_tokens = getattr(store, "get_donor_tokens", None)
+    if get_tokens is None:
+        return None
+
+    from semblend_vllm_connector.types import SemanticSegment
+
+    token_cache: dict = {}
+
+    def identical(i: int) -> bool:
+        did = donor_ids[i]
+        if did not in token_cache:
+            token_cache[did] = get_tokens(did) or []
+        tokens = token_cache[did]
+        d, t = donors[i], targets[i]
+        return (
+            0 <= d < len(tokens) and 0 <= t < len(target_tokens) and tokens[d] == target_tokens[t]
+        )
+
+    order = sorted(range(len(targets)), key=lambda i: targets[i])
+    kept = [i for i in order if identical(i)]
+    segments = []
+    run = []
+    for i in kept + [None]:
+        if run and (
+            i is None
+            or donor_ids[i] != donor_ids[run[-1]]
+            or donors[i] != donors[run[-1]] + 1
+            or targets[i] != targets[run[-1]] + 1
+        ):
+            first = run[0]
+            segments.append(
+                SemanticSegment(
+                    donor_id=str(donor_ids[first]),
+                    donor_start=donors[first],
+                    target_start=targets[first],
+                    token_count=len(run),
+                )
+            )
+            run = []
+        if i is not None:
+            run.append(i)
+    return segments or None
+
+
 MISS_DIAGNOSTIC_KEYS = (
     "rejection_reason",
     "donor_count",
@@ -203,7 +264,9 @@ class SemBlendPipelineProvider:
             return None
         self._last_miss = None
 
-        segments = _segments_from_position_map(result)
+        segments = _segments_from_multi_donor_map(
+            result, self._pipeline, request.token_ids
+        ) or _segments_from_position_map(result)
         return SemanticLookupResult(
             donor_id=result.donor_id,
             similarity=float(result.similarity),

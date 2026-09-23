@@ -121,6 +121,11 @@ class SemBlendVllmConfig:
     # has ruled the load out, so the embedding and search are skipped. The
     # answer is exact in that direction; "maybe" runs the lookup as before.
     lookup_precheck: bool = True
+    # Semantic-span mode: when a lookup returns runs from several donors,
+    # serve one contiguous span assembled from them (pieces meet at any token;
+    # only the span's outer ends are block-aligned). Needs a provider that
+    # returns multi-donor segments (SemBlend with SEMBLEND_MULTI_DONOR=1).
+    multi_donor_spans: bool = True
     # Lowest local prefix-cache boundary (num_computed_tokens) at which the
     # connector will serve; below it the request is declined and the engine
     # prefills it. 0 disables the gate. Why it exists: blocks the connector
@@ -330,6 +335,9 @@ class SemBlendVllmConfig:
             ),
             min_boundary_tokens=_read_int(
                 extra, "min_boundary_tokens", "SEMBLEND_VLLM_MIN_BOUNDARY_TOKENS", 0
+            ),
+            multi_donor_spans=_read_bool(
+                extra, "multi_donor_spans", "SEMBLEND_VLLM_MULTI_DONOR_SPANS", True
             ),
             lookup_precheck=_read_bool(
                 extra, "lookup_precheck", "SEMBLEND_VLLM_LOOKUP_PRECHECK", True

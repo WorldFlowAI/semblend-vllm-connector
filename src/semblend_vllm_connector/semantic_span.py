@@ -85,6 +85,57 @@ def supply_at_boundary(
     return 0, None
 
 
+def chain_at_boundary(
+    runs: Sequence[dict],
+    boundary: int,
+    block_size: int,
+) -> list[dict]:
+    """The longest contiguous span from the boundary, assembled from any donors.
+
+    ``runs`` are token-identity-verified (donor_id, donor_start, target_start,
+    length) runs, possibly from several donors. From the block-aligned
+    boundary the chain repeatedly takes the run covering the current position
+    that reaches furthest -- the greedy interval cover, which maximises the
+    contiguous reach -- so pieces from different donors meet at arbitrary
+    tokens; only the chain's two outer ends are block-aligned, because only
+    those are what vLLM allocates and counts. Returns the pieces in target
+    order, or an empty list when no run covers the boundary.
+    """
+    position = ((boundary + block_size - 1) // block_size) * block_size
+    pieces: list[dict] = []
+    while True:
+        best = None
+        for run in runs:
+            start = int(run["target_start"])
+            end = start + int(run["length"])
+            if start <= position < end and (best is None or end > best[1]):
+                best = (run, end)
+        if best is None:
+            break
+        run, end = best
+        offset = position - int(run["target_start"])
+        pieces.append(
+            {
+                "donor_id": run["donor_id"],
+                "donor_start": int(run["donor_start"]) + offset,
+                "target_start": position,
+                "token_count": end - position,
+            }
+        )
+        position = end
+    return trim_pieces(pieces, (position // block_size) * block_size)
+
+
+def trim_pieces(pieces: Sequence[dict], end: int) -> list[dict]:
+    """``pieces`` cut off at target position ``end``; empty pieces dropped."""
+    out = []
+    for piece in pieces:
+        count = min(int(piece["token_count"]), end - int(piece["target_start"]))
+        if count > 0:
+            out.append({**piece, "token_count": count})
+    return out
+
+
 def rope_cos_sin(positions, head_dim: int, rope_theta: float):
     """Cos/sin tables for the given absolute positions (neox half-split)."""
     import torch

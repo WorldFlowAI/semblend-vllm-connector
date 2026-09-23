@@ -127,6 +127,16 @@ class DonorRegistration:
 
 
 @dataclass(frozen=True)
+class LoadPiece:
+    """One donor's contiguous contribution to a multi-donor span."""
+
+    donor_id: str
+    donor_start: int
+    target_start: int
+    token_count: int
+
+
+@dataclass(frozen=True)
 class PendingLoad:
     request_id: str
     donor_id: str
@@ -144,6 +154,9 @@ class PendingLoad:
     # donor).
     donor_start: int | None = None
     target_start: int | None = None
+    # A span assembled from several donors, back to back in the target. The
+    # scheduler expands it into one load per piece before the worker sees it.
+    pieces: tuple[LoadPiece, ...] = ()
 
 
 @dataclass(frozen=True)

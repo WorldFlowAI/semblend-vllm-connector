@@ -31,11 +31,14 @@ from semblend_vllm_connector.namespace import (
 from semblend_vllm_connector.provider import SemanticKvProvider, load_provider
 from semblend_vllm_connector.semantic_span import (
     block_align_spans,
+    chain_at_boundary,
     supply_at_boundary,
+    trim_pieces,
 )
 from semblend_vllm_connector.types import (
     AuditJoinKey,
     DonorRegistration,
+    LoadPiece,
     MaterializationKind,
     PendingLoad,
     PendingStore,
@@ -1333,6 +1336,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
         boundary: int,
         donor_start: int | None = None,
         target_start: int | None = None,
+        pieces: tuple = (),
     ) -> bool:
         """Memoize a load decision for update_state_after_alloc to build on.
 
@@ -1357,6 +1361,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             "boundary": int(boundary),
             "donor_start": donor_start,
             "target_start": target_start,
+            "pieces": tuple(pieces),
         }
         previous = self._load_plans.get(request_id)
         self._load_plans[request_id] = plan
@@ -1716,6 +1721,10 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     block_size=self._block_size,
                 )
                 return 0, False
+            if self._config.multi_donor_spans and len({s.donor_id for s in result.segments}) > 1:
+                return self._plan_multi_donor_span(
+                    request_id, attempt, result, namespace, token_ids, int(num_computed_tokens)
+                )
             # The donor KV on disk is a block-aligned prefix of the donor's
             # first scheduled chunk; a span reaching past it would load a
             # short tensor and fail the engine at inject. Trim every span
@@ -2048,6 +2057,99 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                 boundary=int(num_computed_tokens),
             )
         return 0, False
+
+    def _plan_multi_donor_span(
+        self,
+        request_id: str,
+        attempt: int,
+        result: SemanticLookupResult,
+        namespace: str,
+        token_ids: list[int],
+        boundary: int,
+    ) -> tuple[int, bool]:
+        """Advertise one contiguous span assembled from several donors' runs.
+
+        The same limits as a single-donor span, applied to the chain: each run
+        is trimmed to what its donor has captured, the chain is capped by
+        max_materialized_tokens and by the prompt's cacheable headroom, and it
+        must still reach min_semantic_span. ``boundary`` is block-aligned (the
+        caller declined otherwise), so the chain starts exactly there.
+        """
+        stored = {
+            donor_id: self._stored_donor_token_count(donor_id, namespace)
+            for donor_id in {seg.donor_id for seg in result.segments}
+        }
+        runs = []
+        for seg in result.segments:
+            length = min(seg.token_count, stored[seg.donor_id] - seg.donor_start)
+            if length > 0:
+                runs.append(
+                    {
+                        "donor_id": seg.donor_id,
+                        "donor_start": seg.donor_start,
+                        "target_start": seg.target_start,
+                        "length": length,
+                    }
+                )
+        pieces = chain_at_boundary(runs, boundary, self._block_size)
+        cap = min(
+            (self._config.max_materialized_tokens // self._block_size) * self._block_size,
+            max(0, _cacheable_prefix_tokens(len(token_ids), self._block_size) - boundary),
+        )
+        pieces = trim_pieces(pieces, boundary + cap)
+        token_count = sum(piece["token_count"] for piece in pieces)
+        donors_used = len({piece["donor_id"] for piece in pieces})
+        if token_count < self._config.min_semantic_span:
+            self._stats["semantic_span_multi_donor_declined_per_attempt"] += 1
+            self._audit_event(
+                "semantic_span_multi_donor_declined",
+                request_id=request_id,
+                attempt=attempt,
+                namespace=namespace,
+                boundary=boundary,
+                token_count=int(token_count),
+                min_semantic_span=int(self._config.min_semantic_span),
+                n_runs=len(runs),
+                donors_in_result=len(stored),
+            )
+            return 0, False
+        first = pieces[0]
+        plan_changed = self._record_load_plan(
+            request_id,
+            donor_id=str(first["donor_id"]),
+            token_count=token_count,
+            materialization_kind=MaterializationKind.SEMANTIC_SPAN,
+            namespace=namespace,
+            boundary=boundary,
+            donor_start=int(first["donor_start"]),
+            target_start=boundary,
+            pieces=tuple(
+                LoadPiece(
+                    donor_id=str(piece["donor_id"]),
+                    donor_start=int(piece["donor_start"]),
+                    target_start=int(piece["target_start"]),
+                    token_count=int(piece["token_count"]),
+                )
+                for piece in pieces
+            ),
+        )
+        if plan_changed:
+            if donors_used > 1:
+                self._stats["semantic_span_multi_donor_loads_total"] += 1
+            self._audit_event(
+                "semantic_span_load_advertised",
+                request_id=request_id,
+                attempt=attempt,
+                donor_id=str(first["donor_id"]),
+                namespace=namespace,
+                token_count=int(token_count),
+                donor_start=int(first["donor_start"]),
+                target_start=boundary,
+                boundary=boundary,
+                donors_used=donors_used,
+                pieces=[dict(piece) for piece in pieces],
+            )
+        return token_count, False
 
     def _span_run_ruled_out(
         self,
@@ -2436,6 +2538,7 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
             block_ids=block_ids,
             donor_start=plan["donor_start"],
             target_start=plan["target_start"],
+            pieces=plan.get("pieces", ()),
         )
         self._served_request_ids.add(request_id)
         self._audit_event(
@@ -2842,6 +2945,22 @@ class SemBlendVllmConnector(KVConnectorBase_V1):
                     namespace=load.namespace,
                     tokens=int(load.token_count),
                     materialization_kind=load.materialization_kind.value,
+                )
+                continue
+            if load.pieces:
+                # One load per donor piece: each is read from its own donor
+                # and re-rotated by its own delta, and each reports its own
+                # blocks if it fails.
+                loads.extend(
+                    replace(
+                        load,
+                        donor_id=piece.donor_id,
+                        token_count=piece.token_count,
+                        donor_start=piece.donor_start,
+                        target_start=piece.target_start,
+                        pieces=(),
+                    )
+                    for piece in load.pieces
                 )
                 continue
             loads.append(load)

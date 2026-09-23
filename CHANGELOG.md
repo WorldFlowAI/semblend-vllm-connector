@@ -38,6 +38,21 @@ evicts them, so a later request with the same leading tokens is served that
 donor-derived KV by the engine's own prefix cache -- the same KV this
 connector would serve it, but without a lookup deciding so.
 
+**Spans assembled from several donors (`multi_donor_spans`, on by default).**
+When a lookup returns token-identical runs from more than one donor, the
+connector serves the longest contiguous span it can chain from the boundary:
+at each step it takes the run covering the current position that reaches
+furthest. Pieces meet at any token; only the span's outer ends are
+block-aligned, which is all vLLM allocates and counts, so this stays inside
+the stock interface. The scheduler expands the plan into one load per piece,
+each read from its own donor, re-rotated by its own delta and reporting its
+own blocks if it fails. The SemBlend adapter builds these runs from a
+multi-donor composite alignment (`SEMBLEND_MULTI_DONOR=1`), keeping only
+positions where the donor holds exactly the target's token. Written as
+`semantic_span_load_advertised` with `donors_used` and `pieces`;
+`semantic_span_multi_donor_declined` when the chain falls short of
+`min_semantic_span`.
+
 ### Changed
 
 **The capture copy no longer stalls the forward pass (`capture_async_copy`,

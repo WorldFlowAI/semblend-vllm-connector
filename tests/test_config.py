@@ -154,6 +154,7 @@ def test_getter_path_carries_every_config_field() -> None:
         "lookup_precheck": "false",
         "capture_async_copy": "false",
         "stage_hint_key": "Stage_Please",
+        "multi_donor_spans": "false",
     }
     # A field added to the config without a line here is exactly the drift
     # this test exists to catch.
@@ -166,6 +167,7 @@ def test_getter_path_carries_every_config_field() -> None:
     assert cfg.lookup_precheck is False
     assert cfg.capture_async_copy is False
     assert cfg.stage_hint_key == "stage_please"
+    assert cfg.multi_donor_spans is False
     assert cfg.min_prompt_tokens == 64
     assert cfg.min_similarity == 0.91
     assert cfg.min_reuse_ratio == 0.33
