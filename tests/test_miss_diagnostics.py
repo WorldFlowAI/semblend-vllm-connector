@@ -225,10 +225,14 @@ def _adapter(store, result):
 def test_every_miss_carries_the_same_keys() -> None:
     for reason in ("no_donor_match", "fuzzy_low_reuse", "low_consumable_coverage"):
         diagnostics = _miss_diagnostics(
-            PipelineResult(found=False, rejection_reason=reason), _Pipeline(_Store()), "vllm:tenant-a"
+            PipelineResult(found=False, rejection_reason=reason),
+            _Pipeline(_Store()),
+            "vllm:tenant-a",
         )
         assert tuple(diagnostics) == MISS_DIAGNOSTIC_KEYS
-    assert tuple(_miss_diagnostics(None, _Pipeline(_Store()), "vllm:tenant-a")) == MISS_DIAGNOSTIC_KEYS
+    assert (
+        tuple(_miss_diagnostics(None, _Pipeline(_Store()), "vllm:tenant-a")) == MISS_DIAGNOSTIC_KEYS
+    )
 
 
 def test_a_total_miss_reports_no_similarity_rather_than_a_default() -> None:

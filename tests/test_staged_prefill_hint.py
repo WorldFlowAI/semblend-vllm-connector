@@ -90,7 +90,9 @@ def test_a_stage_is_never_captured_under_any_policy(tmp_path) -> None:
 
 
 def test_the_memory_tier_keeps_pageable_copies() -> None:
-    import torch
+    import pytest
+
+    torch = pytest.importorskip("torch")
 
     from semblend_vllm_connector.connector import _pageable
 

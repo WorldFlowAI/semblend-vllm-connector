@@ -13,12 +13,14 @@ from __future__ import annotations
 import sys
 import types
 
-import torch
+import pytest
 from test_deferred_capture_write import LAYER_NAME, _config, _store
 
 from semblend_vllm_connector._vllm_compat import KVConnectorRole
 from semblend_vllm_connector.connector import SemBlendVllmConnector
 from semblend_vllm_connector.types import SemBlendConnectorMetadata
+
+torch = pytest.importorskip("torch")
 
 
 class _Event:
