@@ -125,7 +125,8 @@ class SemBlendVllmConfig:
     # serve one contiguous span assembled from them (pieces meet at any token;
     # only the span's outer ends are block-aligned). Needs a provider that
     # returns multi-donor segments (SemBlend with SEMBLEND_MULTI_DONOR=1).
-    multi_donor_spans: bool = True
+    # Off until answer quality has been measured for assembled spans.
+    multi_donor_spans: bool = False
     # Segmented prefill, for an engine whose scheduler asks the connector
     # again part-way through a prefill (get_num_new_matched_tokens_mid_prefill
     # and get_prefill_compute_limit; not in stock vLLM). Later segments reuse
@@ -346,7 +347,7 @@ class SemBlendVllmConfig:
                 extra, "min_mid_prefill_segment", "SEMBLEND_VLLM_MIN_MID_PREFILL_SEGMENT", 128
             ),
             multi_donor_spans=_read_bool(
-                extra, "multi_donor_spans", "SEMBLEND_VLLM_MULTI_DONOR_SPANS", True
+                extra, "multi_donor_spans", "SEMBLEND_VLLM_MULTI_DONOR_SPANS", False
             ),
             lookup_precheck=_read_bool(
                 extra, "lookup_precheck", "SEMBLEND_VLLM_LOOKUP_PRECHECK", True

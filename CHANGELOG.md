@@ -38,7 +38,7 @@ evicts them, so a later request with the same leading tokens is served that
 donor-derived KV by the engine's own prefix cache -- the same KV this
 connector would serve it, but without a lookup deciding so.
 
-**Spans assembled from several donors (`multi_donor_spans`, on by default).**
+**Spans assembled from several donors (`multi_donor_spans`, off by default).**
 When a lookup returns token-identical runs from more than one donor, the
 connector serves the longest contiguous span it can chain from the boundary:
 at each step it takes the run covering the current position that reaches
@@ -51,7 +51,8 @@ multi-donor composite alignment (`SEMBLEND_MULTI_DONOR=1`), keeping only
 positions where the donor holds exactly the target's token. Written as
 `semantic_span_load_advertised` with `donors_used` and `pieces`;
 `semantic_span_multi_donor_declined` when the chain falls short of
-`min_semantic_span`.
+`min_semantic_span`. Off by default in this release: answer quality for
+assembled spans has not yet been measured on GPU.
 
 **Segmented prefill hooks (for a scheduler that asks mid-prefill).**
 `get_prefill_compute_limit(request, position)` says how far to compute before
@@ -60,7 +61,8 @@ the next reusable run (to the first block edge inside it), and
 that run when the chunk reaches it. Both reuse the request's admission lookup,
 so every later segment costs a plan, not a search. Stock vLLM does not call
 them; they exist for a scheduler change proposed separately
-(`min_mid_prefill_segment`, default 128, is the floor for a later segment).
+(`min_mid_prefill_segment`, default 128, is the floor for a later segment). The connector declares
+`supports_segmented_prefill = True`, the opt-in such a scheduler checks.
 
 ### Changed
 

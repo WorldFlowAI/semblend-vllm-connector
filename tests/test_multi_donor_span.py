@@ -97,6 +97,7 @@ class _Provider:
 
 
 def _serving_connector(tmp_path, **overrides):
+    overrides.setdefault("multi_donor_spans", True)
     connector = _connector(tmp_path, **overrides)
     connector._provider = _Provider()  # noqa: SLF001
     connector._stored_donor_token_count = lambda donor_id, namespace: 4096  # noqa: SLF001
@@ -173,3 +174,9 @@ def test_the_provider_keeps_only_identical_tokens():
         ("b", 3, 10, 4),
         ("b", 8, 15, 5),
     ]
+
+
+def test_off_by_default():
+    from semblend_vllm_connector.config import SemBlendVllmConfig
+
+    assert SemBlendVllmConfig().multi_donor_spans is False
